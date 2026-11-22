@@ -15,6 +15,10 @@ import (
 	"github.com/thovilabs/browser-ctl/internal/relay"
 )
 
+// SpareTabIDStart is the first spare public tab ID: when a Chrome tab ID
+// collides across browsers, the later tab gets a spare from here up (JS).
+const SpareTabIDStart = 100001
+
 // BrowserSummary is what `browser list` reports for one browser.
 type BrowserSummary struct {
 	ID          string `json:"id"`
@@ -48,8 +52,10 @@ type Backend struct {
 // New builds a backend over a running relay server.
 func New(server *relay.Server) *Backend {
 	return &Backend{
-		server: server,
-		slots:  map[string]*relay.Browser{},
+		server:    server,
+		refs:      map[int]*Tab{},
+		nextSpare: SpareTabIDStart,
+		slots:     map[string]*relay.Browser{},
 	}
 }
 
@@ -115,19 +121,86 @@ func (b *Backend) UnavailableReason() string {
 
 // DefaultBrowser returns the last-focused usable browser, else the
 // last-connected one, else nil.
-// deuda-tecnica: IDs públicos estables (spare >=100001 si el ID de Chrome
-// choca entre navegadores) no implementados todavía; se usan los IDs de
-// Chrome tal cual. Mejorar cuando haya multi-navegador real en pruebas.
 func (b *Backend) DefaultBrowser() *relay.Browser {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.defaultLocked()
 }
 
+// refreshLocked assigns stable public IDs to every live tab (call with
+// b.mu held). A tab keeps its Chrome ID as public ID unless that ID is
+// already a public ID (taken by another browser's tab, live or closed);
+// then it gets a spare from nextSpare up. Public IDs are never reused
+// within a daemon run, so a stale ID can never name another tab.
+// deuda-tecnica: solo probado en vivo con un navegador; la colision real
+// entre dos navegadores solo esta cubierta por el test con extension falsa.
+// Mejorar cuando haya multi-navegador real en pruebas.
+func (b *Backend) refreshLocked() {
+	if b.refs == nil {
+		b.refs = map[int]*Tab{}
+	}
+	if b.nextSpare < SpareTabIDStart {
+		b.nextSpare = SpareTabIDStart
+	}
+	for _, key := range b.order {
+		br, ok := b.slots[key]
+		if !ok {
+			continue
+		}
+		for _, t := range br.Conn.State().Tabs {
+			if _, ok := b.publicIDLocked(key, t.TabID); ok {
+				continue // already mapped, keep its public ID
+			}
+			pub := t.TabID
+			if _, taken := b.refs[pub]; taken {
+				for {
+					pub = b.nextSpare
+					b.nextSpare++
+					if _, taken := b.refs[pub]; !taken {
+						break
+					}
+				}
+			}
+			b.refs[pub] = &Tab{ExposedTab: t, Browser: key}
+		}
+	}
+}
+
+// publicIDLocked returns the public ID of a tab, if mapped (call with
+// b.mu held).
+func (b *Backend) publicIDLocked(profile string, chromeID int) (int, bool) {
+	for pub, tab := range b.refs {
+		if tab.Browser == profile && tab.TabID == chromeID {
+			return pub, true
+		}
+	}
+	return 0, false
+}
+
+// resolveLocked translates a public ID to its browser and Chrome tab ID,
+// only when the tab is still live in that browser (call with b.mu held).
+func (b *Backend) resolveLocked(publicID int) (*relay.Browser, int, bool) {
+	tab, ok := b.refs[publicID]
+	if !ok {
+		return nil, 0, false
+	}
+	br, ok := b.slots[tab.Browser]
+	if !ok {
+		return nil, 0, false
+	}
+	for _, t := range br.Conn.State().Tabs {
+		if t.TabID == tab.TabID {
+			return br, t.TabID, true
+		}
+	}
+	return nil, 0, false
+}
+
 // Tabs returns all exposed tabs across browsers, with public IDs.
 func (b *Backend) Tabs() []Tab {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.refreshLocked()
 	var out []Tab
 	for _, key := range b.order {
 		br, ok := b.slots[key]
@@ -135,7 +208,13 @@ func (b *Backend) Tabs() []Tab {
 			continue
 		}
 		for _, t := range br.Conn.State().Tabs {
-			out = append(out, Tab{ExposedTab: t, Browser: key})
+			pub, ok := b.publicIDLocked(key, t.TabID)
+			if !ok {
+				continue // refresh just mapped it; defensive
+			}
+			shown := t
+			shown.TabID = pub
+			out = append(out, Tab{ExposedTab: shown, Browser: key})
 		}
 	}
 	return out
@@ -193,14 +272,12 @@ func (b *Backend) defaultLocked() *relay.Browser {
 func (b *Backend) FindTab(publicID int) *relay.Browser {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, br := range b.slots {
-		for _, t := range br.Conn.State().Tabs {
-			if t.TabID == publicID {
-				return br
-			}
-		}
+	b.refreshLocked()
+	br, _, ok := b.resolveLocked(publicID)
+	if !ok {
+		return nil
 	}
-	return nil
+	return br
 }
 
 // TabClosed is true only when the owning browser is connected+paired and
@@ -208,15 +285,13 @@ func (b *Backend) FindTab(publicID int) *relay.Browser {
 func (b *Backend) TabClosed(publicID int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.refreshLocked()
+	if _, _, ok := b.resolveLocked(publicID); ok {
+		return false
+	}
 	for _, br := range b.slots {
-		st := br.Conn.State()
-		if st.Pairing != "paired" {
+		if br.Conn.State().Pairing != "paired" {
 			return false
-		}
-		for _, t := range st.Tabs {
-			if t.TabID == publicID {
-				return false
-			}
 		}
 	}
 	return len(b.slots) > 0
@@ -238,11 +313,21 @@ func (b *Backend) CreateTab(url string, app protocol.AppInfo) (int, error) {
 	}
 	// The extension answers before its tab registry updates; wait
 	// briefly so a following Claim finds the tab instead of failing
-	// with "tab %d is not open".
+	// with "tab %d is not open". Returns the tab's public ID, not the
+	// raw Chrome ID (they differ when the ID collides across browsers).
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if b.FindTab(r.TabID) != nil {
-			return r.TabID, nil
+		for _, t := range br.Conn.State().Tabs {
+			if t.TabID == r.TabID {
+				b.mu.Lock()
+				b.refreshLocked()
+				pub, ok := b.publicIDLocked(br.Profile, r.TabID)
+				b.mu.Unlock()
+				if ok {
+					return pub, nil
+				}
+				return r.TabID, nil
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -251,31 +336,40 @@ func (b *Backend) CreateTab(url string, app protocol.AppInfo) (int, error) {
 
 // CloseTab asks the owning browser to close a tab.
 func (b *Backend) CloseTab(publicID int) error {
-	br := b.FindTab(publicID)
-	if br == nil {
+	b.mu.Lock()
+	b.refreshLocked()
+	br, chromeID, ok := b.resolveLocked(publicID)
+	b.mu.Unlock()
+	if !ok {
 		return fmt.Errorf("tab %d is not open", publicID)
 	}
-	_, err := br.Conn.Request("closeTab", protocol.CloseTabParams{TabID: publicID})
+	_, err := br.Conn.Request("closeTab", protocol.CloseTabParams{TabID: chromeID})
 	return err
 }
 
 // ActivateTab brings a tab to the front.
 func (b *Backend) ActivateTab(publicID int) error {
-	br := b.FindTab(publicID)
-	if br == nil {
+	b.mu.Lock()
+	b.refreshLocked()
+	br, chromeID, ok := b.resolveLocked(publicID)
+	b.mu.Unlock()
+	if !ok {
 		return fmt.Errorf("tab %d is not open", publicID)
 	}
-	_, err := br.Conn.Request("activateTab", protocol.ActivateTabParams{TabID: publicID})
+	_, err := br.Conn.Request("activateTab", protocol.ActivateTabParams{TabID: chromeID})
 	return err
 }
 
 // GroupTab assigns a tab to an app's group (app nil = ungroup).
 func (b *Backend) GroupTab(publicID int, app *protocol.AppInfo) error {
-	br := b.FindTab(publicID)
-	if br == nil {
+	b.mu.Lock()
+	b.refreshLocked()
+	br, chromeID, ok := b.resolveLocked(publicID)
+	b.mu.Unlock()
+	if !ok {
 		return fmt.Errorf("tab %d is not open", publicID)
 	}
-	_, err := br.Conn.Request("groupTab", protocol.GroupTabParams{TabID: publicID, App: app})
+	_, err := br.Conn.Request("groupTab", protocol.GroupTabParams{TabID: chromeID, App: app})
 	return err
 }
 
@@ -283,11 +377,14 @@ func (b *Backend) GroupTab(publicID int, app *protocol.AppInfo) error {
 // Only claimed tabs are CDP targets. The client is registered in the
 // browser's event registry so the tab's CDP events reach the engine.
 func (b *Backend) Claim(publicID int) (*cdp.Client, error) {
-	br := b.FindTab(publicID)
-	if br == nil {
+	b.mu.Lock()
+	b.refreshLocked()
+	br, chromeID, ok := b.resolveLocked(publicID)
+	b.mu.Unlock()
+	if !ok {
 		return nil, fmt.Errorf("tab %d is not open", publicID)
 	}
-	client, err := cdp.Attach(br.Conn, publicID)
+	client, err := cdp.Attach(br.Conn, chromeID)
 	if err != nil {
 		return nil, err
 	}
