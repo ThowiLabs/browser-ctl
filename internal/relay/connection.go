@@ -47,6 +47,24 @@ type Connection struct {
 	onClose    func(code int, reason string)
 	onCDPEvent func(tabID int, sessionID, method string, params json.RawMessage)
 	onDetached func(tabID int, reason string)
+
+	// Optional handlers set after Accept (extension tab lifecycle events).
+	onTabOpened   func(protocol.TabOpened)
+	onTabAssigned func(protocol.TabAssigned)
+}
+
+// SetTabOpenedHandler registers the handler for tabOpened events.
+func (c *Connection) SetTabOpenedHandler(fn func(protocol.TabOpened)) {
+	c.mu.Lock()
+	c.onTabOpened = fn
+	c.mu.Unlock()
+}
+
+// SetTabAssignedHandler registers the handler for tabAssigned events.
+func (c *Connection) SetTabAssignedHandler(fn func(protocol.TabAssigned)) {
+	c.mu.Lock()
+	c.onTabAssigned = fn
+	c.mu.Unlock()
 }
 
 // Accept waits for the extension's hello, checks the protocol and answers welcome with our
@@ -267,6 +285,26 @@ func (c *Connection) handleFrame(frame map[string]json.RawMessage) {
 			var d protocol.Detached
 			if err := json.Unmarshal(e.Event.Data, &d); err == nil && c.onDetached != nil {
 				c.onDetached(d.TabID, d.Reason)
+			}
+		case "tabOpened":
+			var t protocol.TabOpened
+			if err := json.Unmarshal(e.Event.Data, &t); err == nil {
+				c.mu.Lock()
+				fn := c.onTabOpened
+				c.mu.Unlock()
+				if fn != nil {
+					fn(t)
+				}
+			}
+		case "tabAssigned":
+			var t protocol.TabAssigned
+			if err := json.Unmarshal(e.Event.Data, &t); err == nil {
+				c.mu.Lock()
+				fn := c.onTabAssigned
+				c.mu.Unlock()
+				if fn != nil {
+					fn(t)
+				}
 			}
 		}
 	case "pong":

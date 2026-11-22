@@ -53,6 +53,24 @@ type Server struct {
 	mu        sync.Mutex
 	browsers  map[string]*Browser
 	byProfile map[string]string
+
+	// Optional handlers set by the daemon (client WS + shutdown).
+	onClient   func(w http.ResponseWriter, r *http.Request)
+	onShutdown func(w http.ResponseWriter, r *http.Request)
+}
+
+// SetClientHandler registers the /client WebSocket handler (daemon mode).
+func (s *Server) SetClientHandler(fn func(w http.ResponseWriter, r *http.Request)) {
+	s.mu.Lock()
+	s.onClient = fn
+	s.mu.Unlock()
+}
+
+// SetShutdownHandler registers the POST /shutdown handler (daemon mode).
+func (s *Server) SetShutdownHandler(fn func(w http.ResponseWriter, r *http.Request)) {
+	s.mu.Lock()
+	s.onShutdown = fn
+	s.mu.Unlock()
 }
 
 // StartServer listens on the first free port of RelayPorts (or a fixed one if port != 0).
@@ -80,6 +98,26 @@ func StartServer(port int, key *PairingKey, version string, logf func(string, ..
 		mux := http.NewServeMux()
 		mux.HandleFunc(protocol.PathStatus, s.handleStatus)
 		mux.HandleFunc(protocol.PathExtension, s.handleExtensionWS)
+		mux.HandleFunc("/client", func(w http.ResponseWriter, r *http.Request) {
+			s.mu.Lock()
+			fn := s.onClient
+			s.mu.Unlock()
+			if fn == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			fn(w, r)
+		})
+		mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {
+			s.mu.Lock()
+			fn := s.onShutdown
+			s.mu.Unlock()
+			if fn == nil {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			fn(w, r)
+		})
 		s.httpServer = &http.Server{Handler: mux}
 		go func() {
 			if err := s.httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
