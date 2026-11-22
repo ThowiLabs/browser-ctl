@@ -23,7 +23,7 @@ func doClick(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if err := checkActionable(ctx.Engine, client, box); err != nil {
+	if err := checkActionable(ctx.Engine, client, ctx.Session, ctx.Args[0], box); err != nil {
 		return "", "", err
 	}
 	_, dbl := ctx.Flags["double"]
@@ -131,7 +131,7 @@ func doFill(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	expr, err := ResolveTarget(ctx.Engine, client, ctx.Args[0])
+	expr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, ctx.Args[0])
 	if err != nil {
 		return "", "", err
 	}
@@ -214,7 +214,7 @@ func doSelect(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	expr, err := ResolveTarget(ctx.Engine, client, ctx.Args[0])
+	expr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, ctx.Args[0])
 	if err != nil {
 		return "", "", err
 	}
@@ -230,7 +230,7 @@ func doCheck(ctx *Context, uncheck bool) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	expr, err := ResolveTarget(ctx.Engine, client, ctx.Args[0])
+	expr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, ctx.Args[0])
 	if err != nil {
 		return "", "", err
 	}
@@ -270,6 +270,13 @@ func resolveBoxSess(e *Engine, client *cdp.Client, sess *Session, target string)
 	// Snapshot refs resolve via the last snapshot's ref table.
 	if refRe.MatchString(target) {
 		return resolveRefBox(e, client, sess, target)
+	}
+	// Locators: primero el árbol AX del último snapshot (preciso, con
+	// el id de nodo DOM); sin coincidencia, la traducción JS.
+	if sess != nil {
+		if ref, ok := locatorAXRef(sess, target); ok {
+			return resolveRefBox(e, client, sess, ref)
+		}
 	}
 	expr, err := ResolveTarget(e, client, target)
 	if err != nil {
@@ -369,22 +376,90 @@ func boxByBackendNode(client *cdp.Client, backendNodeID int) (box, error) {
 }
 
 // checkActionable mirrors JS: visible, enabled, not covered by another
-// element at its centre (elementFromPoint, shadow roots).
-func checkActionable(e *Engine, client *cdp.Client, b box) error {
+// element at its centre (elementFromPoint). The hit-test compares the
+// element at the click point with the target itself: if another element
+// covers it, the click would land elsewhere, so it fails loudly instead
+// of succeeding silently (contexto/04, hallazgo 4).
+func checkActionable(e *Engine, client *cdp.Client, sess *Session, target string, b box) error {
 	if b.W == 0 || b.H == 0 {
 		return fmt.Errorf("element is not visible (zero size)")
 	}
-	js := fmt.Sprintf("(function(){var el=document.elementFromPoint(%v,%v); if(!el) return 'covered'; var r=el.getBoundingClientRect(); if(r.width===0) return 'hidden'; return 'ok';})()", b.CX, b.CY)
-	raw, err := e.eval(client, js)
+	// Frame refs skip the hit-test: the point is in the main viewport
+	// but the element lives in the frame's own coordinates.
+	// deuda-tecnica: hit-test en iframes; hacerlo requeriría evaluar en
+	// el contexto del frame. Disparador: un click en iframe que falle en
+	// silencio por estar cubierto.
+	if refRe.MatchString(target) && strings.Contains(target, "f") {
+		return nil
+	}
+	// Precise path for snapshot refs: backend DOM node id.
+	if refRe.MatchString(target) && sess != nil {
+		sess.mu.Lock()
+		backendID, ok := sess.LastRefNodes[target]
+		sess.mu.Unlock()
+		if ok && backendID != 0 {
+			return hitTestNode(client, backendID, b)
+		}
+	}
+	expr, err := ResolveTargetSess(e, client, sess, target)
+	if err != nil {
+		return err
+	}
+	raw, err := e.eval(client, fmt.Sprintf("(function(){var el=%s; if(!el) return 'noelement'; var at=document.elementFromPoint(%v,%v); if(!at) return 'none'; if(at===el||el.contains(at)) return 'ok'; return 'covered';})()", expr, b.CX, b.CY))
 	if err != nil {
 		return err
 	}
 	var s string
 	_ = json.Unmarshal(raw, &s)
-	if s != "ok" {
+	return hitTestResult(s)
+}
+
+// hitTestNode runs the hit-test on a DOM node resolved by backend id
+// (Runtime.callFunctionOn with this = the element).
+func hitTestNode(client *cdp.Client, backendNodeID int, b box) error {
+	raw, err := client.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendNodeID})
+	if err != nil {
+		return err
+	}
+	var res struct {
+		Object struct {
+			ObjectID string `json:"objectId"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil || res.Object.ObjectID == "" {
+		return fmt.Errorf("could not resolve node %d", backendNodeID)
+	}
+	fn := fmt.Sprintf("function(){var at=document.elementFromPoint(%v,%v); if(!at) return 'none'; if(this===at||this.contains(at)) return 'ok'; return 'covered';}", b.CX, b.CY)
+	raw, err = client.Call("Runtime.callFunctionOn", map[string]any{
+		"objectId": res.Object.ObjectID, "functionDeclaration": fn, "returnByValue": true,
+	})
+	if err != nil {
+		return err
+	}
+	var out struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return err
+	}
+	return hitTestResult(out.Result.Value)
+}
+
+func hitTestResult(s string) error {
+	switch s {
+	case "ok":
+		return nil
+	case "covered":
+		return fmt.Errorf("element is covered by another element at its centre (the click would hit a different element)")
+	case "none":
+		return fmt.Errorf("no element at the click point")
+	case "noelement":
+		return fmt.Errorf("no element matched the target")
+	default:
 		return fmt.Errorf("element is not actionable (%s at its centre)", s)
 	}
-	return nil
 }
 
 // currentURL reads location.href, best-effort.

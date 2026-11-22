@@ -41,6 +41,16 @@ var interactiveRoles = map[string]bool{
 	"spinbutton": true, "treeitem": true, "heading": true,
 }
 
+// AXEntry is one snapshot node kept for locator resolution: its ref,
+// role and accessible name, in document order.
+type AXEntry struct {
+	Ref       string
+	Role      string
+	Name      string
+	Value     string
+	BackendID int
+}
+
 func doSnapshot(ctx *Context) (string, string, error) {
 	client, _, err := ctx.Engine.ensureClient(ctx.Session)
 	if err != nil {
@@ -53,21 +63,23 @@ func doSnapshot(ctx *Context) (string, string, error) {
 	_, interactive := ctx.Flags["i"]
 	max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
 
-	snap, refs, nodes, err := ctx.Engine.axSnapshot(client, depth, interactive)
+	snap, refs, nodes, ax, err := ctx.Engine.axSnapshot(client, depth, interactive)
 	if err != nil {
 		return "", "", err
 	}
 	ctx.Session.mu.Lock()
 	ctx.Session.LastRefs = refs
 	ctx.Session.LastRefNodes = nodes
+	ctx.Session.LastAX = ax
 	ctx.Session.mu.Unlock()
 	return cap(snap, max), "", nil
 }
 
 // axSnapshot builds the snapshot from Accessibility.getFullAXTree.
-// Returns the rendered snapshot, ref->JS-expr map, and ref->backend DOM
-// node id map (0 when the node has no backend id).
-func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (string, map[string]string, map[string]int, error) {
+// Returns the rendered snapshot, ref->JS-expr map, ref->backend DOM node
+// id map (0 when the node has no backend id), and the nodes in document
+// order for locator resolution.
+func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (string, map[string]string, map[string]int, []AXEntry, error) {
 	// Frame tree first, so refs in iframes get the f<index> prefix.
 	frameIndex := map[string]int{}
 	if raw, err := client.Call("Page.getFrameTree", map[string]any{}); err == nil {
@@ -94,13 +106,13 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 	// tree (root + 2 levels). Omitting it returns the full tree.
 	raw, err := client.Call("Accessibility.getFullAXTree", map[string]any{})
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 	var res struct {
 		Nodes []axNode `json:"nodes"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 	byID := map[string]*axNode{}
 	for i := range res.Nodes {
@@ -121,6 +133,7 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 	}
 	refs := map[string]string{}
 	nodes := map[string]int{}
+	var ax []AXEntry
 	next := 1
 	var lines []string
 	var walk func(n *axNode, level int)
@@ -162,6 +175,7 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 				if n.BackendDOMNodeID != 0 {
 					nodes[ref] = n.BackendDOMNodeID
 				}
+				ax = append(ax, AXEntry{Ref: ref, Role: role, Name: name, Value: n.Value.Value, BackendID: n.BackendDOMNodeID})
 			}
 		}
 		if keep {
@@ -187,9 +201,9 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 		walk(r, 0)
 	}
 	if len(lines) == 0 {
-		return "(empty page)", refs, nodes, nil
+		return "(empty page)", refs, nodes, ax, nil
 	}
-	return strings.Join(lines, "\n"), refs, nodes, nil
+	return strings.Join(lines, "\n"), refs, nodes, ax, nil
 }
 
 // axNodeExpr returns a JS expression for an AX node, falling back to a
@@ -222,7 +236,7 @@ func doFind(ctx *Context) (string, string, error) {
 		text = ctx.Args[0]
 	}
 	max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
-	snap, _, _, err := ctx.Engine.axSnapshot(client, 0, false)
+	snap, _, _, _, err := ctx.Engine.axSnapshot(client, 0, false)
 	if err != nil {
 		return "", "", err
 	}

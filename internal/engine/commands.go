@@ -41,15 +41,69 @@ func CheckLine(ln CommandLine) error {
 	if !ok {
 		return fmt.Errorf("unknown command %q (run `help`)", ln.Name)
 	}
-	_, _, err := ParseArgs(ln.Args, def.Flags)
+	args, _, err := ParseArgs(ln.Args, def.Flags)
 	if err != nil {
 		return err
 	}
-	args, _, _ := ParseArgs(ln.Args, def.Flags)
+	args = mergeTargetArgs(ln.Name, args)
 	if def.MaxArgs >= 0 && len(args) > def.MaxArgs {
 		return fmt.Errorf("%s takes at most %d argument(s)", ln.Name, def.MaxArgs)
 	}
 	return nil
+}
+
+// mergeTargetArgs junta un target locator de varias palabras en un solo
+// argumento: el parser divide por espacios, pero `click getByRole button
+// "Nombre"` es un único target. Solo se junta cuando el primer token es
+// un método locator (así `fill e12 hello world` sigue fallando por
+// MaxArgs como antes, en vez de rellenar mal). drag y upload quedan
+// fuera: dos targets o rutas no se pueden separar sin ambigüedad.
+// deuda-tecnica: los targets en flags (--gone, --in) tampoco se juntan.
+func mergeTargetArgs(name string, args []string) []string {
+	// get lleva el target al final (get count <target>, get attr <name>
+	// <target>): el locator empieza en args[1:] o args[2:].
+	if name == "get" {
+		if len(args) < 2 {
+			return args
+		}
+		switch args[0] {
+		case "count", "value", "text":
+			if len(args) > 2 && startsLocator(args[1:]) {
+				return append([]string{args[0]}, strings.Join(args[1:], " "))
+			}
+		case "attr":
+			if len(args) > 3 && startsLocator(args[2:]) {
+				return append([]string{args[0], args[1]}, strings.Join(args[2:], " "))
+			}
+		}
+		return args
+	}
+	if !startsLocator(args) {
+		return args
+	}
+	switch name {
+	case "click", "hover", "check", "uncheck", "screenshot", "snapshot":
+		if len(args) > 1 {
+			return []string{strings.Join(args, " ")}
+		}
+	case "fill", "select":
+		if len(args) > 2 {
+			return append([]string{strings.Join(args[:len(args)-1], " ")}, args[len(args)-1])
+		}
+	}
+	return args
+}
+
+// startsLocator dice si los tokens empiezan por un método locator
+// (forma con espacios: `getByRole button "Nombre"`).
+func startsLocator(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	first := args[0]
+	first = strings.TrimPrefix(first, "page.")
+	_, ok := locatorMethods[first]
+	return ok
 }
 
 // HelpText lists all commands, like JS `help`.

@@ -60,6 +60,9 @@ type Session struct {
 	// LastRefNodes maps snapshot refs to backend DOM node ids (from the
 	// accessibility tree), for precise CDP resolution.
 	LastRefNodes map[string]int
+	// LastAX is the last snapshot's nodes in document order (ref, role,
+	// accessible name), for locator resolution against the AX tree.
+	LastAX []AXEntry
 }
 
 // AddCapabilities enables capabilities (e.g. "cdp") on the session.
@@ -344,6 +347,7 @@ func (e *Engine) runStep(sess *Session, ln CommandLine) (output, note string, er
 	if err != nil {
 		return "", "", err
 	}
+	args = mergeTargetArgs(ln.Name, args)
 	if def.MaxArgs >= 0 && len(args) > def.MaxArgs {
 		return "", "", fmt.Errorf("%s takes at most %d argument(s)", ln.Name, def.MaxArgs)
 	}

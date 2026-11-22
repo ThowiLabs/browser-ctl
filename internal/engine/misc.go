@@ -100,7 +100,11 @@ func doUpload(ctx *Context) (string, string, error) {
 }
 
 // nodeIDForTarget resolves a target to a DOM nodeId for DOM.* commands.
+// Locators resolve through the AX snapshot to a ref first.
 func nodeIDForTarget(e *Engine, client *cdp.Client, sess *Session, target string) (int, error) {
+	if ref, ok := locatorAXRef(sess, target); ok {
+		target = ref
+	}
 	if refRe.MatchString(target) {
 		sess.mu.Lock()
 		backendID, ok := sess.LastRefNodes[target]
@@ -212,7 +216,7 @@ func doDownload(ctx *Context) (string, string, error) {
 	url := arg
 	if !isURLArgument(arg) {
 		// A target: read its href/src.
-		tExpr, err := ResolveTarget(ctx.Engine, client, arg)
+		tExpr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, arg)
 		if err != nil {
 			return "", "", err
 		}
