@@ -112,11 +112,43 @@ func doEval(ctx *Context) (string, string, error) {
 		return "", "", err
 	}
 	max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
-	raw, err := ctx.Engine.eval(client, ctx.Args[0])
+	target := "undefined"
+	if len(ctx.Args) > 1 {
+		tExpr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, ctx.Args[1])
+		if err != nil {
+			return "", "", err
+		}
+		target = tExpr
+	}
+	raw, err := ctx.Engine.eval(client, wrapEvalExpr(ctx.Args[0], target))
 	if err != nil {
 		return "", "", err
 	}
-	return cap(string(raw), max), "", nil
+	return cap(formatEvalValue(raw), max), "", nil
+}
+
+// wrapEvalExpr invoca la expresión cuando es una función (semántica del
+// JS original: la función corre con el elemento objetivo como argumento);
+// un valor plano pasa tal cual. Un ";" final se ignora para no romper
+// expresiones copiadas con punto y coma.
+func wrapEvalExpr(expr, target string) string {
+	expr = strings.TrimSpace(expr)
+	expr = strings.TrimRight(expr, ";")
+	return fmt.Sprintf("(function(){var f=(%s); if(typeof f==='function'){return f(%s);} return f;})()", expr, target)
+}
+
+// formatEvalValue imprime un valor CDP: strings sin comillas JSON, el
+// resto como JSON (null incluido: unmarshalar null a string no da error,
+// así que se distingue por tipo).
+func formatEvalValue(raw json.RawMessage) string {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return string(raw)
 }
 
 func doScreenshot(ctx *Context) (string, string, error) {

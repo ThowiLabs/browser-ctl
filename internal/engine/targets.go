@@ -296,6 +296,25 @@ func ResolveTarget(e *Engine, client *cdp.Client, target string) (string, error)
 	return "", fmt.Errorf("unknown target kind")
 }
 
+// ResolveTargetSess resuelve un target a una expresión JS usando la tabla
+// de refs del snapshot de la sesión para las refs (locators y CSS pasan
+// por ResolveTarget).
+func ResolveTargetSess(e *Engine, client *cdp.Client, sess *Session, target string) (string, error) {
+	if refRe.MatchString(target) {
+		if sess == nil {
+			return "", fmt.Errorf("ref targets need a snapshot first (run `snapshot`)")
+		}
+		sess.mu.Lock()
+		expr, ok := sess.LastRefs[target]
+		sess.mu.Unlock()
+		if !ok {
+			return "", fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", target)
+		}
+		return expr, nil
+	}
+	return ResolveTarget(e, client, target)
+}
+
 // locatorToJS translates whitelisted locator calls into a JS query.
 // getByRole/getByText/etc. are approximated with DOM queries; exact
 // Playwright semantics live in the snapshot's ARIA tree (milestone 4).

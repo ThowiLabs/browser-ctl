@@ -194,14 +194,17 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 
 // axNodeExpr returns a JS expression for an AX node, falling back to a
 // role+name query. Precise resolution uses the backend DOM node id
-// (LastRefNodes) via DOM.resolveNode instead.
+// (LastRefNodes) via DOM.resolveNode instead. The query covers both the
+// explicit role attribute and the implicit tag for the role: a plain
+// [role="link"] misses <a> elements, which have no role attribute.
 func axNodeExpr(n *axNode) string {
 	role := n.Role.Value
 	name := n.Name.Value
+	sel := fmt.Sprintf("[role=%q],%s", role, roleTag(role))
 	if name != "" {
-		return fmt.Sprintf("(function(){var els=Array.from(document.querySelectorAll('[role=\"%s\"]')); return els.find(function(el){return (el.innerText||el.getAttribute('aria-label')||'').indexOf(%s)>=0;})||null;})()", role, jsonString(name))
+		return fmt.Sprintf("(function(){var els=Array.from(document.querySelectorAll(%s)); return els.find(function(el){return (el.innerText||el.getAttribute('aria-label')||'').indexOf(%s)>=0;})||null;})()", jsonString(sel), jsonString(name))
 	}
-	return fmt.Sprintf("document.querySelector('[role=\"%s\"]')", role)
+	return fmt.Sprintf("document.querySelector(%s)", jsonString(sel))
 }
 
 func strconv_Quote(s string) string {
