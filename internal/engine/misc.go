@@ -14,14 +14,22 @@ import (
 	"github.com/thovilabs/browser-ctl/internal/cdp"
 )
 
-// doDialog answers an open dialog, then resumes the interrupted step.
+// doDialog answers an open dialog, then resumes the interrupted step
+// (JS dialog command: the step finishes within this call, which holds
+// the tab).
 func doDialog(ctx *Context) (string, string, error) {
 	client, ts, err := ctx.Engine.ensureClient(ctx.Session)
 	if err != nil {
 		return "", "", err
 	}
-	if len(ctx.Args) == 0 {
-		return "", "", fmt.Errorf("dialog needs accept|dismiss")
+	if len(ctx.Args) == 0 || (ctx.Args[0] != "accept" && ctx.Args[0] != "dismiss") {
+		return "", "", fmt.Errorf("dialog takes accept or dismiss")
+	}
+	captureMu.Lock()
+	dialog := ts.Dialog
+	captureMu.Unlock()
+	if dialog == nil {
+		return "", "", fmt.Errorf("No dialog is open")
 	}
 	accept := ctx.Args[0] == "accept"
 	params := map[string]any{"accept": accept}
@@ -31,15 +39,14 @@ func doDialog(ctx *Context) (string, string, error) {
 	if _, err := client.Call("Page.handleJavaScriptDialog", params); err != nil {
 		return "", "", err
 	}
+	// The Closed event clears ts.Dialog too; clear it here so a missed
+	// event can't leave a stale dialog behind.
+	captureMu.Lock()
 	ts.Dialog = nil
-	// Resume the interrupted step, up to 10 s.
-	if ts.Abandoned != nil {
-		select {
-		case <-ts.Abandoned:
-		case <-timeAfter(10 * time.Second):
-		}
-		ts.Abandoned = nil
-	}
+	captureMu.Unlock()
+	// The step the dialog interrupted goes on now: it finishes within
+	// this call, which holds the tab (JS).
+	ctx.Engine.finishAbandoned(ts)
 	return "", "", nil
 }
 

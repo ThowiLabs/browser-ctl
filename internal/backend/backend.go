@@ -54,12 +54,17 @@ func New(server *relay.Server) *Backend {
 }
 
 // NoteBrowser registers a newly connected browser. Called by the relay
-// server's extension handler (wired in daemon startup).
+// server's extension handler (wired in daemon startup). It also gives the
+// browser its event registry: the relay hands every cdpEvent to
+// Browser.Events, so without it no CDP event ever reached the engine.
 func (b *Backend) NoteBrowser(br *relay.Browser) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, ok := b.slots[br.Profile]; !ok {
 		b.order = append(b.order, br.Profile)
+	}
+	if br.Events == nil {
+		br.Events = cdp.NewRegistry()
 	}
 	b.slots[br.Profile] = br
 }
@@ -275,13 +280,24 @@ func (b *Backend) GroupTab(publicID int, app *protocol.AppInfo) error {
 }
 
 // Claim attaches the debugger to a tab and returns a CDP client.
-// Only claimed tabs are CDP targets.
+// Only claimed tabs are CDP targets. The client is registered in the
+// browser's event registry so the tab's CDP events reach the engine.
 func (b *Backend) Claim(publicID int) (*cdp.Client, error) {
 	br := b.FindTab(publicID)
 	if br == nil {
 		return nil, fmt.Errorf("tab %d is not open", publicID)
 	}
-	return cdp.Attach(br.Conn, publicID)
+	client, err := cdp.Attach(br.Conn, publicID)
+	if err != nil {
+		return nil, err
+	}
+	if br.Events == nil {
+		br.Events = cdp.NewRegistry()
+	}
+	if reg, ok := br.Events.(*cdp.Registry); ok && reg != nil {
+		reg.Register(client)
+	}
+	return client, nil
 }
 
 // WhenReady waits (up to 20 s) for a usable browser.

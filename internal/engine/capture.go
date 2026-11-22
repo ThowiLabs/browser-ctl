@@ -144,6 +144,21 @@ func (e *Engine) captureEvent(ts *TabState, method string, params json.RawMessag
 				break
 			}
 		}
+	case "Page.javascriptDialogOpening":
+		// A JS dialog opened: remember it so the engine can block other
+		// steps and `dialog` can answer it (JS TabState.dialog, set by
+		// page.on("dialog")).
+		var ev struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(params, &ev) != nil {
+			return
+		}
+		ts.Dialog = &Dialog{Type: ev.Type, Message: ev.Message}
+	case "Page.javascriptDialogClosed":
+		// Answered in Chrome (or by `dialog`): the dialog is gone.
+		ts.Dialog = nil
 	}
 	// Agent-subscribed CDP events (cdp on <event>).
 	for _, sub := range ts.CDPEvents {

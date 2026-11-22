@@ -7,6 +7,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -297,7 +298,27 @@ func (e *Engine) Run(sess *Session, input string) (string, error) {
 	var out []string
 	var pageNote string
 	for i, ln := range lines {
-		stepOut, note, err := e.runStep(sess, ln)
+		if preErr := e.preStep(sess, ln); preErr != nil {
+			out = append(out, fmt.Sprintf("✗ step %d: %s — %s", ln.Step, echoLine(ln), preErr.Error()))
+			if i+1 < len(lines) {
+				out = append(out, fmt.Sprintf("Steps %d–%d not run", lines[i+1].Step, lines[len(lines)-1].Step))
+			}
+			if pageNote != "" {
+				out = append(out, pageNote)
+			}
+			return strings.Join(out, "\n"), preErr
+		}
+		stepOut, note, dialogOpened, err := e.runStep(sess, ln)
+		if dialogOpened != nil {
+			out = append(out, fmt.Sprintf("✓ %s — %s opened. Answer it with `dialog accept` or `dialog dismiss`", echoLine(ln), dialogLabel(dialogOpened)))
+			if i+1 < len(lines) {
+				out = append(out, fmt.Sprintf("Steps %d–%d not run (a dialog is open)", lines[i+1].Step, lines[len(lines)-1].Step))
+			}
+			if pageNote != "" {
+				out = append(out, pageNote)
+			}
+			return strings.Join(out, "\n"), nil
+		}
 		if err != nil {
 			out = append(out, fmt.Sprintf("✗ step %d: %s — %s", ln.Step, echoLine(ln), err.Error()))
 			if i+1 < len(lines) {
@@ -340,19 +361,199 @@ func echoLine(ln CommandLine) string {
 	return ln.Source
 }
 
-// runStep runs one validated line.
-func (e *Engine) runStep(sess *Session, ln CommandLine) (output, note string, err error) {
+// runStep runs one validated line, racing the step against a dialog
+// opening mid-step and its timeout (JS runStep): a dialog wins the race,
+// the step stays on the tab as abandoned and the batch stops; a timeout
+// abandons the step (it may still finish later, its result is dropped).
+func (e *Engine) runStep(sess *Session, ln CommandLine) (output, note string, dialogOpened *Dialog, err error) {
 	def := CommandsByName[ln.Name]
 	args, flags, err := ParseArgs(ln.Args, def.Flags)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	args = mergeTargetArgs(ln.Name, args)
 	if def.MaxArgs >= 0 && len(args) > def.MaxArgs {
-		return "", "", fmt.Errorf("%s takes at most %d argument(s)", ln.Name, def.MaxArgs)
+		return "", "", nil, fmt.Errorf("%s takes at most %d argument(s)", ln.Name, def.MaxArgs)
 	}
 	ctx := &Context{Engine: e, Session: sess, Args: args, Flags: flags, Line: ln}
-	return def.Run(ctx)
+	// The dialog open before the step, so only a NEW one interrupts it.
+	before := e.currentDialog(sess)
+	type stepResult struct {
+		output, note string
+		err          error
+	}
+	done := make(chan stepResult, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- stepResult{"", "", fmt.Errorf("step panicked: %v", r)}
+			}
+		}()
+		o, n, err := def.Run(ctx)
+		done <- stepResult{o, n, err}
+	}()
+	timeout := stepTimeout(def, args, flags)
+	deadline := time.After(timeout)
+	poll := time.NewTicker(50 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case r := <-done:
+			return r.output, r.note, nil, r.err
+		case <-deadline:
+			return "", "", nil, fmt.Errorf("timed out after %s; the step was abandoned", formatSeconds(timeout))
+		case <-poll.C:
+			if d := e.currentDialog(sess); d != nil && d != before {
+				// A dialog opened mid-step: keep the step on the tab
+				// so `dialog` resumes it (JS: state.abandoned = step).
+				ch := make(chan struct{})
+				e.setAbandoned(sess, ch)
+				go func() { <-done; close(ch) }()
+				return "", "", d, nil
+			}
+		}
+	}
+}
+
+// preStep runs before each step: it finishes the step a dialog
+// interrupted once the dialog is gone, and blocks every other step while
+// a dialog is open (JS engine.run loop).
+func (e *Engine) preStep(sess *Session, ln CommandLine) error {
+	ts := e.currentTabState(sess)
+	if ts == nil {
+		return nil
+	}
+	captureMu.Lock()
+	abandoned, dialog := ts.Abandoned, ts.Dialog
+	captureMu.Unlock()
+	if abandoned != nil && dialog == nil {
+		e.finishAbandoned(ts)
+	}
+	if dialog != nil && !stepWhileDialog(ln) {
+		return fmt.Errorf("%s is open. Answer it with `dialog accept` or `dialog dismiss` first", dialogLabel(dialog))
+	}
+	return nil
+}
+
+// stepWhileDialog reports whether a line may run while a dialog is open
+// (JS whileDialog: tab, browser, help and dialog always; wait only as a
+// plain sleep — wait --text/--gone/--url needs the page, which the dialog
+// blocks).
+func stepWhileDialog(ln CommandLine) bool {
+	def := CommandsByName[ln.Name]
+	if def != nil && def.WhileDialog {
+		return true
+	}
+	if ln.Name != "wait" || def == nil {
+		return false
+	}
+	args, flags, err := ParseArgs(ln.Args, def.Flags)
+	if err != nil || len(args) != 1 {
+		return false
+	}
+	if _, err := strconv.Atoi(args[0]); err != nil {
+		return false
+	}
+	_, hasText := flags["text"]
+	_, hasGone := flags["gone"]
+	_, hasURL := flags["url"]
+	return !hasText && !hasGone && !hasURL
+}
+
+// stepTimeout is how long a step may run before it's abandoned (JS
+// stepTimeout: the command's own time plus headroom, at least 30 s; a
+// plain `wait` and --timeout count as the step's own time).
+func stepTimeout(def *CommandDef, args []string, flags map[string]string) time.Duration {
+	t := DefaultStepTimeout
+	if def.Timeout > 0 && def.Timeout+StepHeadroom > t {
+		t = def.Timeout + StepHeadroom
+	}
+	own := -1
+	if def.Name == "wait" && len(args) == 1 {
+		if ms, err := strconv.Atoi(args[0]); err == nil {
+			own = ms
+		}
+	}
+	if f, ok := flags["timeout"]; ok {
+		if ms, err := strconv.Atoi(f); err == nil && ms >= 0 {
+			own = ms
+		}
+	}
+	if own >= 0 {
+		if own > int(TimeoutMax.Milliseconds()) {
+			own = int(TimeoutMax.Milliseconds())
+		}
+		if d := time.Duration(own)*time.Millisecond + StepHeadroom; d > t {
+			t = d
+		}
+	}
+	return t
+}
+
+// formatSeconds prints a duration like JS formatSeconds ("30 s").
+func formatSeconds(d time.Duration) string {
+	return fmt.Sprintf("%g s", d.Seconds())
+}
+
+// dialogLabel names an open dialog like JS: `alert dialog "I am a JS Alert"`.
+func dialogLabel(d *Dialog) string {
+	return fmt.Sprintf("%s dialog %q", d.Type, truncate(d.Message, 200))
+}
+
+// currentTabState returns the TabState of the session's current tab, if
+// claimed (it never claims: no state means no dialog and no abandoned step).
+func (e *Engine) currentTabState(sess *Session) *TabState {
+	tabID := e.CurrentTab(sess)
+	if tabID == 0 {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.tabState[tabID]
+}
+
+// currentDialog returns the open dialog on the session's current tab, if any.
+func (e *Engine) currentDialog(sess *Session) *Dialog {
+	ts := e.currentTabState(sess)
+	if ts == nil {
+		return nil
+	}
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	return ts.Dialog
+}
+
+// setAbandoned keeps a step on the tab so `dialog` can resume it once the
+// dialog is answered (JS: state.abandoned = step).
+func (e *Engine) setAbandoned(sess *Session, ch chan struct{}) {
+	ts := e.currentTabState(sess)
+	if ts == nil {
+		return
+	}
+	captureMu.Lock()
+	ts.Abandoned = ch
+	captureMu.Unlock()
+}
+
+// finishAbandoned waits (up to 10 s, JS ABANDONED_WAIT_MS) for the step a
+// dialog interrupted to finish, so it doesn't act during a later call.
+// The step's error is swallowed: its line already printed (JS).
+func (e *Engine) finishAbandoned(ts *TabState) {
+	finishAbandonedTimeout(ts, 10*time.Second)
+}
+
+func finishAbandonedTimeout(ts *TabState, timeout time.Duration) {
+	captureMu.Lock()
+	ch := ts.Abandoned
+	ts.Abandoned = nil
+	captureMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+	}
 }
 
 // Context is what a command implementation receives.

@@ -46,6 +46,55 @@ type Client struct {
 	eventCh   chan event
 	done      chan struct{}
 	closed    bool
+	registry  *Registry // set by Registry.Register; Close unregisters
+}
+
+// Registry routes CDP events from one browser connection to the clients
+// attached to its tabs. The relay hands it every cdpEvent; without it no
+// CDP event reached the engine at all (console/request buffers and
+// Page.javascriptDialogOpening were dead live, though the fake-extension
+// test called DispatchEvent directly).
+type Registry struct {
+	mu      sync.Mutex
+	clients map[int]*Client
+}
+
+// NewRegistry builds an empty registry.
+func NewRegistry() *Registry {
+	return &Registry{clients: map[int]*Client{}}
+}
+
+// Register adds a client so its tab's events reach it.
+func (r *Registry) Register(c *Client) {
+	c.mu.Lock()
+	c.registry = r
+	c.mu.Unlock()
+	r.mu.Lock()
+	r.clients[c.tabID] = c
+	r.mu.Unlock()
+}
+
+// Unregister removes a tab's client (on Close, or when the debugger
+// detached from the tab).
+func (r *Registry) Unregister(tabID int) {
+	r.mu.Lock()
+	delete(r.clients, tabID)
+	r.mu.Unlock()
+}
+
+// Dispatch routes one event to the client attached to the tab, if any.
+func (r *Registry) Dispatch(tabID int, sessionID, method string, params json.RawMessage) {
+	r.mu.Lock()
+	c := r.clients[tabID]
+	r.mu.Unlock()
+	if c != nil {
+		c.DispatchEvent(method, params)
+	}
+}
+
+// DispatchDetached drops the client of a tab the debugger detached from.
+func (r *Registry) DispatchDetached(tabID int, reason string) {
+	r.Unregister(tabID)
 }
 
 // Attach connects to a tab and enables the domains the engine relies on.
@@ -143,8 +192,12 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
+	reg := c.registry
 	close(c.done)
 	c.mu.Unlock()
+	if reg != nil {
+		reg.Unregister(c.tabID)
+	}
 	return c.Detach()
 }
 
