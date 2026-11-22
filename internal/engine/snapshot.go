@@ -52,6 +52,31 @@ type AXEntry struct {
 	BackendID int
 }
 
+// axChecked returns "checked", "unchecked" or "mixed" for checkable
+// roles, from the AX "checked" property. "" when not applicable.
+func axChecked(n *axNode) (string, bool) {
+	switch n.Role.Value {
+	case "checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio":
+	default:
+		return "", false
+	}
+	for _, p := range n.Properties {
+		if p.Name != "checked" {
+			continue
+		}
+		switch v := p.Value.Value.(type) {
+		case bool:
+			if v {
+				return "checked", true
+			}
+			return "unchecked", true
+		case string:
+			return v, true
+		}
+	}
+	return "", false
+}
+
 func doSnapshot(ctx *Context) (string, string, error) {
 	client, _, err := ctx.Engine.ensureClient(ctx.Session)
 	if err != nil {
@@ -198,6 +223,9 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 				if n.Value.Value != "" {
 					line += ": " + n.Value.Value
 				}
+				if c, ok := axChecked(n); ok {
+					line += ": " + c
+				}
 				lines = append(lines, line)
 			}
 			for _, c := range n.ChildIDs {
@@ -209,10 +237,10 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 		for _, r := range roots {
 			walk(r, 0)
 		}
-		if len(lines) > 0 || attempt >= 6 {
+		if len(lines) > 0 || attempt >= 10 {
 			break
 		}
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 	if len(lines) == 0 {
 		return "(empty page)", refs, nodes, ax, nil

@@ -20,5 +20,7 @@ Yahir vio 6 pestanas de /checkboxes (1288343065-1288343070). Investigacion:
 ## Tabla de pruebas
 | # | Comando / pagina | Resultado | Evidencia |
 |---|---|---|---|
-| 0 | snapshot -i tras goto (/checkboxes) | FAIL -> FIXED | "(empty page)" intermitente; reintento en axSnapshot; estres 11/12, arranque en frio 3/3 |
+| 0 | snapshot -i tras goto (/checkboxes) | FAIL -> FIXED | "(empty page)" intermitente; reintento en axSnapshot (10x500 ms); estres 11/12 con 6 intentos, arranque en frio 3/3 con 10 intentos; 1 vacio mas en m5 (pestana fresca + dyno lento, >5 s) — el reintento cubre lo habitual, no lo extremo |
+| 0b | snapshot muestra estado checked | PASS | `- checkbox [ref=e5]: false` / `[ref=e6]: true` (la 2a viene marcada por defecto en el sitio); antes no se veia el estado |
+| 1 | check/uncheck (/checkboxes) | PASS | `check e5` -> eval checked `true`; `uncheck e5` -> eval checked `false` |
 | B | goto reutiliza pestana (4x ejemplo.com) | PASS | Solo 3071 creada (sesion fresca); 3 gotos siguientes sin pestana nueva |
