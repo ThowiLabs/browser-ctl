@@ -1,5 +1,0 @@
-Summary:
-Registrar prueba real en YouTube Studio
-
-Description:
-Prueba real en el canal HirCoir: Panel, IA Preguntarle a Studio con resumen y pregunta propia, Analytics, Contenido y busqueda Telcel, todo con la v2. Hallazgos: eval no invoca la funcion (tarea 07), click con locator de varias palabras no pasa el parser, refs que caducan al re-renderizar, primer click en Contenido sin efecto. Capturas en el Escritorio de Yahir.
