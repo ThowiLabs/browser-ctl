@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/thovilabs/browser-ctl/internal/cdp"
 )
@@ -104,101 +105,114 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 	}
 	// No depth param: CDP treats an explicit depth of 0 as a shallow
 	// tree (root + 2 levels). Omitting it returns the full tree.
-	raw, err := client.Call("Accessibility.getFullAXTree", map[string]any{})
-	if err != nil {
-		return "", nil, nil, nil, err
-	}
-	var res struct {
-		Nodes []axNode `json:"nodes"`
-	}
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return "", nil, nil, nil, err
-	}
-	byID := map[string]*axNode{}
-	for i := range res.Nodes {
-		byID[res.Nodes[i].NodeID] = &res.Nodes[i]
-	}
-	// Find the root (node with no parent).
-	isChild := map[string]bool{}
-	for _, n := range res.Nodes {
-		for _, c := range n.ChildIDs {
-			isChild[c] = true
-		}
-	}
-	var roots []*axNode
-	for i := range res.Nodes {
-		if !isChild[res.Nodes[i].NodeID] {
-			roots = append(roots, &res.Nodes[i])
-		}
-	}
+	// Right after a navigation Chrome can return a tree that renders
+	// no lines yet (it is still building it); retry briefly so a
+	// snapshot does not report "(empty page)" on a loaded page.
 	refs := map[string]string{}
 	nodes := map[string]int{}
 	var ax []AXEntry
-	next := 1
 	var lines []string
-	var walk func(n *axNode, level int)
-	walk = func(n *axNode, level int) {
-		if depth > 0 && level > depth {
-			return
+	for attempt := 0; ; attempt++ {
+		raw, err := client.Call("Accessibility.getFullAXTree", map[string]any{})
+		if err != nil {
+			return "", nil, nil, nil, err
 		}
-		if n.Ignored {
+		var res struct {
+			Nodes []axNode `json:"nodes"`
+		}
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return "", nil, nil, nil, err
+		}
+		byID := map[string]*axNode{}
+		for i := range res.Nodes {
+			byID[res.Nodes[i].NodeID] = &res.Nodes[i]
+		}
+		// Find the root (node with no parent).
+		isChild := map[string]bool{}
+		for _, n := range res.Nodes {
+			for _, c := range n.ChildIDs {
+				isChild[c] = true
+			}
+		}
+		var roots []*axNode
+		for i := range res.Nodes {
+			if !isChild[res.Nodes[i].NodeID] {
+				roots = append(roots, &res.Nodes[i])
+			}
+		}
+		refs = map[string]string{}
+		nodes = map[string]int{}
+		ax = nil
+		next := 1
+		lines = nil
+		var walk func(n *axNode, level int)
+		walk = func(n *axNode, level int) {
+			if depth > 0 && level > depth {
+				return
+			}
+			if n.Ignored {
+				for _, c := range n.ChildIDs {
+					if child, ok := byID[c]; ok {
+						walk(child, level)
+					}
+				}
+				return
+			}
+			role := n.Role.Value
+			if role == "" {
+				role = "generic"
+			}
+			name := n.Name.Value
+			keep := true
+			if interactive {
+				keep = interactiveRoles[role] || role == "main" || role == "navigation" || role == "banner" || role == "contentinfo"
+				if role == "StaticText" {
+					keep = false
+				}
+			}
+			ref := ""
+			if !interactive || keep {
+				// Only interactive/named nodes get refs.
+				if role != "StaticText" && role != "generic" {
+					if idx, ok := frameIndex[n.FrameID]; ok && idx > 0 {
+						ref = fmt.Sprintf("f%de%d", idx, next)
+					} else {
+						ref = fmt.Sprintf("e%d", next)
+					}
+					next++
+					refs[ref] = axNodeExpr(n)
+					if n.BackendDOMNodeID != 0 {
+						nodes[ref] = n.BackendDOMNodeID
+					}
+					ax = append(ax, AXEntry{Ref: ref, Role: role, Name: name, Value: n.Value.Value, BackendID: n.BackendDOMNodeID})
+				}
+			}
+			if keep {
+				line := strings.Repeat("  ", level) + "- " + role
+				if name != "" {
+					line += " " + strconv_Quote(name)
+				}
+				if ref != "" {
+					line += " [ref=" + ref + "]"
+				}
+				if n.Value.Value != "" {
+					line += ": " + n.Value.Value
+				}
+				lines = append(lines, line)
+			}
 			for _, c := range n.ChildIDs {
 				if child, ok := byID[c]; ok {
-					walk(child, level)
+					walk(child, level+1)
 				}
 			}
-			return
 		}
-		role := n.Role.Value
-		if role == "" {
-			role = "generic"
+		for _, r := range roots {
+			walk(r, 0)
 		}
-		name := n.Name.Value
-		keep := true
-		if interactive {
-			keep = interactiveRoles[role] || role == "main" || role == "navigation" || role == "banner" || role == "contentinfo"
-			if role == "StaticText" {
-				keep = false
-			}
+		if len(lines) > 0 || attempt >= 6 {
+			break
 		}
-		ref := ""
-		if !interactive || keep {
-			// Only interactive/named nodes get refs.
-			if role != "StaticText" && role != "generic" {
-				if idx, ok := frameIndex[n.FrameID]; ok && idx > 0 {
-					ref = fmt.Sprintf("f%de%d", idx, next)
-				} else {
-					ref = fmt.Sprintf("e%d", next)
-				}
-				next++
-				refs[ref] = axNodeExpr(n)
-				if n.BackendDOMNodeID != 0 {
-					nodes[ref] = n.BackendDOMNodeID
-				}
-				ax = append(ax, AXEntry{Ref: ref, Role: role, Name: name, Value: n.Value.Value, BackendID: n.BackendDOMNodeID})
-			}
-		}
-		if keep {
-			line := strings.Repeat("  ", level) + "- " + role
-			if name != "" {
-				line += " " + strconv_Quote(name)
-			}
-			if ref != "" {
-				line += " [ref=" + ref + "]"
-			}
-			if n.Value.Value != "" {
-				line += ": " + n.Value.Value
-			}
-			lines = append(lines, line)
-		}
-		for _, c := range n.ChildIDs {
-			if child, ok := byID[c]; ok {
-				walk(child, level+1)
-			}
-		}
-	}
-	for _, r := range roots {
-		walk(r, 0)
+		time.Sleep(400 * time.Millisecond)
 	}
 	if len(lines) == 0 {
 		return "(empty page)", refs, nodes, ax, nil
