@@ -25,24 +25,29 @@ const appName = "browser-ctl"
 
 // Engine executes commands against a browser.
 type Engine struct {
-	conn    *relay.Connection
-	app     protocol.AppInfo
-	tabs    map[int]bool
-	current int
-	logf    func(string, ...any)
+	conn     *relay.Connection
+	registry *eventRegistry
+	app      protocol.AppInfo
+	tabs     map[int]bool
+	current  int
+	logf     func(string, ...any)
 
 	// refs maps e# refs (from the last snapshot) to their DOM index.
 	refs map[string]int
 }
 
-// NewEngine builds an engine over a connected browser.
+// NewEngine builds an engine over a connected browser and wires its CDP-event registry
+// into the browser so extension cdpEvent / detached events reach the clients.
 func NewEngine(browser *relay.Browser, logf func(string, ...any)) *Engine {
+	reg := newEventRegistry()
+	browser.Events = reg
 	return &Engine{
-		conn:   browser.Conn,
-		app:    protocol.AppInfo{ID: appID, Name: appName},
-		tabs:   map[int]bool{},
-		logf:   logf,
-		refs:   map[string]int{},
+		conn:     browser.Conn,
+		registry: reg,
+		app:      protocol.AppInfo{ID: appID, Name: appName},
+		tabs:     map[int]bool{},
+		logf:     logf,
+		refs:     map[string]int{},
 	}
 }
 
@@ -124,6 +129,8 @@ func (e *Engine) exec(line string) (commandResult, error) {
 		err = e.doTab(args, &res)
 	case "scroll":
 		err = e.doScroll(args, &res)
+	case "drag":
+		err = e.doDrag(args, &res)
 	case "browser":
 		res.Output = "1 browser connected"
 	case "help":
@@ -141,6 +148,9 @@ func (e *Engine) exec(line string) (commandResult, error) {
 
 func (e *Engine) doGoto(args string, res *commandResult) error {
 	url := normalizeURL(args)
+	if err := requireExposedURL(url); err != nil {
+		return err
+	}
 	if e.current == 0 {
 		tabID, err := e.createTab(url)
 		if err != nil {
@@ -184,7 +194,14 @@ func (e *Engine) createTab(url string) (int, error) {
 }
 
 func (e *Engine) attach(tabID int) (*cdp.Client, error) {
-	return cdp.Attach(e.conn, tabID)
+	client, err := cdp.Attach(e.conn, tabID)
+	if err != nil {
+		return nil, err
+	}
+	if e.registry != nil {
+		e.registry.Register(client)
+	}
+	return client, nil
 }
 
 // ensureClient returns a client for the current tab, creating the tab if needed.
@@ -422,6 +439,72 @@ func (e *Engine) doScroll(args string, res *commandResult) error {
 	return err
 }
 
+// doDrag drags from one point to another. Each point is "x,y" or a snapshot ref (e12)
+// (centered). Example: drag e3 100,200 or drag 10,10 200,300.
+func (e *Engine) doDrag(args string, res *commandResult) error {
+	client, err := e.ensureClient()
+	if err != nil {
+		return err
+	}
+	fields := strings.Fields(args)
+	if len(fields) < 2 {
+		return fmt.Errorf("drag needs two points: <x,y|ref> <x,y|ref>")
+	}
+	start, err := e.dragPoint(client, fields[0])
+	if err != nil {
+		return err
+	}
+	end, err := e.dragPoint(client, fields[1])
+	if err != nil {
+		return err
+	}
+	steps := 20
+	for i := 0; i <= steps; i++ {
+		x := start.x + (end.x-start.x)*float64(i)/float64(steps)
+		y := start.y + (end.y-start.y)*float64(i)/float64(steps)
+		typ := "mouseMoved"
+		if i == 0 {
+			typ = "mousePressed"
+		} else if i == steps {
+			typ = "mouseReleased"
+		}
+		if _, err := client.Call("Input.dispatchMouseEvent", map[string]any{
+			"type": typ, "x": x, "y": y, "button": "left", "clickCount": 1,
+		}); err != nil {
+			return err
+		}
+	}
+	res.Output = fmt.Sprintf("dragged %g,%g → %g,%g", start.x, start.y, end.x, end.y)
+	return nil
+}
+
+type dragPoint struct{ x, y float64 }
+
+func (e *Engine) dragPoint(client *cdp.Client, s string) (dragPoint, error) {
+	var p dragPoint
+	if ref := refRe.FindString(s); ref != "" && strings.TrimSpace(s) == ref {
+		idx, err := e.resolveTarget(client, s)
+		if err != nil {
+			return p, err
+		}
+		box, err := e.nodeBox(client, idx)
+		if err != nil {
+			return p, err
+		}
+		return dragPoint{x: box.X + box.Width/2, y: box.Y + box.Height/2}, nil
+	}
+	parts := strings.Split(s, ",")
+	if len(parts) != 2 {
+		return p, fmt.Errorf("drag point %q must be x,y or a ref", s)
+	}
+	x, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	y, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err1 != nil || err2 != nil {
+		return p, fmt.Errorf("drag point %q must be x,y or a ref", s)
+	}
+	return dragPoint{x: x, y: y}, nil
+}
+
 // --- Reading ---
 
 func (e *Engine) doWait(args string, res *commandResult) error {
@@ -435,7 +518,7 @@ func (e *Engine) doWait(args string, res *commandResult) error {
 			ms = 60000
 		}
 		_, err = client.Call("Runtime.evaluate", map[string]any{
-			"expression": fmt.Sprintf("new Promise(r => setTimeout(r, %d))", ms),
+			"expression":   fmt.Sprintf("new Promise(r => setTimeout(r, %d))", ms),
 			"awaitPromise": true,
 		})
 		return err
@@ -451,7 +534,14 @@ func (e *Engine) doWait(args string, res *commandResult) error {
 		}
 		return e.waitForCondition(client, fmt.Sprintf("location.href.indexOf(%s) >= 0", jsonString(url)))
 	}
-	return fmt.Errorf("wait needs <ms>, --text \"...\" or --url <url>")
+	if strings.HasPrefix(args, "--selector") {
+		sel, _ := extractQuoted(args)
+		if sel == "" {
+			sel = strings.TrimSpace(strings.TrimPrefix(args, "--selector"))
+		}
+		return e.waitForCondition(client, fmt.Sprintf("document.querySelector(%s) !== null", jsonString(sel)))
+	}
+	return fmt.Errorf("wait needs <ms>, --text \"...\", --url <url> or --selector \"<css>\"")
 }
 
 func (e *Engine) waitForCondition(client *cdp.Client, condition string) error {
@@ -740,6 +830,20 @@ func (e *Engine) doTab(args string, res *commandResult) error {
 		}
 		e.current = id
 		e.tabs[id] = true
+	case "focus":
+		if len(fields) < 2 {
+			return fmt.Errorf("tab focus needs a tab id")
+		}
+		id, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return err
+		}
+		if _, err := e.conn.Request("activateTab", protocol.ActivateTabParams{TabID: id}); err != nil {
+			return err
+		}
+		e.current = id
+		e.tabs[id] = true
+		res.Output = fmt.Sprintf("tab %d focused", id)
 	case "close":
 		id := e.current
 		if len(fields) > 1 {
@@ -1137,13 +1241,13 @@ var _ = image.Black
 var helpText = `commands (one per line):
   goto <url> | back | forward | reload
   click <target> [--double] [--button left|right] [--modifiers Shift,Control]
-  hover <target> | scroll top|bottom|<dir> [<px>]
+  hover <target> | scroll top|bottom|<dir> [<px>] | drag <x,y|ref> <x,y|ref>
   fill <target> "<text>" [--submit] | type "<text>" | press <key>
   select <target> "<value>"... | check|uncheck <target>
-  wait <ms> | wait --text "<t>" | wait --url <url>
+  wait <ms> | wait --text "<t>" | wait --url <url> | wait --selector "<css>"
   snapshot | find "<text>"
   get text|value|count <target> | get url | get title
   screenshot [--path <file>] | eval "<js>"
-  tab list|new [url]|select <id>|close [id]
+  tab list|new [url]|select <id>|focus <id>|close [id]
   help [command]
 targets: e12 (snapshot refs), getByRole('button', {name:'Go'}), getByText('...'), or CSS`
