@@ -109,8 +109,10 @@ run flags:
   --port N          relay port (default: first free of 9010, 9011, 9012)
   --commands-file   read the commands from this file
 
-Commands (one per line): goto, back, forward, reload, click, hover, scroll, fill, type,
-press, select, check, uncheck, wait, snapshot, find, get, screenshot, eval, tab, help.
+Commands (one per line): goto, back, forward, reload, click, hover, scroll, drag, fill,
+type, press, select, check, uncheck, wait, snapshot, find, get, screenshot, eval, tab, help.
+  tab subcommands: list, new [url], select <id>, focus <id>, close [id]
+  wait forms: <ms>, --text "<t>", --url <url>, --selector "<css>"
 Targets: e12 (snapshot refs), getByRole('button', {name:'Go'}), getByText('...'), or CSS.
 `)
 }
