@@ -119,27 +119,46 @@ func nodeIDForTarget(e *Engine, client *cdp.Client, sess *Session, target string
 		if !ok || backendID == 0 {
 			return 0, fmt.Errorf("ref %s has no DOM node id. Run `snapshot` again", target)
 		}
-		raw, err := client.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendID})
-		if err != nil {
-			return 0, err
+		// backendNodeId -> objectId -> nodeId. A node resolved from the
+		// AX tree may come back with nodeId 0: the DOM agent only
+		// assigns nodeIds to nodes it has pushed, and right after attach
+		// it has pushed nothing. Push the whole tree once and retry.
+		resolve := func() (int, error) {
+			raw, err := client.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendID})
+			if err != nil {
+				return 0, err
+			}
+			var res struct {
+				Object struct {
+					ObjectID string `json:"objectId"`
+				} `json:"object"`
+			}
+			_ = json.Unmarshal(raw, &res)
+			raw, err = client.Call("DOM.describeNode", map[string]any{"objectId": res.Object.ObjectID})
+			if err != nil {
+				return 0, err
+			}
+			var desc struct {
+				Node struct {
+					NodeID int `json:"nodeId"`
+				} `json:"node"`
+			}
+			_ = json.Unmarshal(raw, &desc)
+			return desc.Node.NodeID, nil
 		}
-		var res struct {
-			Object struct {
-				ObjectID string `json:"objectId"`
-			} `json:"object"`
+		nodeID, err := resolve()
+		if err != nil || nodeID == 0 {
+			if _, gerr := client.Call("DOM.getDocument", map[string]any{"depth": -1, "pierce": true}); gerr == nil {
+				nodeID, err = resolve()
+			}
+			if err != nil {
+				return 0, err
+			}
+			if nodeID == 0 {
+				return 0, fmt.Errorf("ref %s has no DOM node id. Run `snapshot` again", target)
+			}
 		}
-		_ = json.Unmarshal(raw, &res)
-		raw, err = client.Call("DOM.describeNode", map[string]any{"objectId": res.Object.ObjectID})
-		if err != nil {
-			return 0, err
-		}
-		var desc struct {
-			Node struct {
-				NodeID int `json:"nodeId"`
-			} `json:"node"`
-		}
-		_ = json.Unmarshal(raw, &desc)
-		return desc.Node.NodeID, nil
+		return nodeID, nil
 	}
 	t, err := ParseTarget(target)
 	if err != nil {

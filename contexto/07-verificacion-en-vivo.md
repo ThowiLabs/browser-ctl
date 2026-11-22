@@ -25,6 +25,11 @@ Ojo al verificar esta pagina: la pagina intercambia innerHTML, NO el orden de lo
 ## Hallazgo D - snapshot con solo la raiz tras goto (BUG REAL, arreglado)
 El snapshot completo justo despues de `goto` devolvia solo `- RootWebArea [ref=e1]` (el arbol aun se estaba construyendo). El reintento del Hallazgo A solo disparaba con 0 lineas; ahora tambien reintenta con 1 sola linea (raiz) hasta 10x500 ms. Verificado en /drag_and_drop: tras el arreglo el snapshot trae el arbol completo en el primer intento. Coste: un snapshot de about:blank (pagina realmente vacia) tarda hasta 5 s.
 
+## Hallazgo E - upload fallaba con "Could not find node with given id" (BUG REAL, arreglado)
+`upload e5` en /upload fallaba siempre en un attach fresco, aunque cada llamada CDP suelta funcionaba por separado (`cdp DOM.resolveNode`, `describeNode`, `setFileInputFiles`). Causa raiz, encontrada con `cdp DOM.describeNode '{"objectId":"0.2.2"}'`: el nodo resuelto desde el arbol AX devuelve `"nodeId": 0` — el agente DOM solo asigna nodeIds a los nodos que ha empujado (via getDocument/querySelector), y tras un attach no ha empujado nada. `resolveNode` y `describeNode` no fallan, pero el nodeId 0 luego rompe `describeNode`/`setFileInputFiles`. Arreglo en `nodeIDForTarget` (internal/engine/misc.go): si el nodeId sale 0 (o resolveNode falla), se hace un `DOM.getDocument` depth -1 para empujar el arbol y se resuelve de nuevo. Verificado con daemon recien reiniciado: `upload e5` funciona a la primera ("uploaded 1 file(s)" -> "File Uploaded!" + test-upload.txt). Nota: click/hover/drag no se veian afectados porque su camino preciso usa backendNodeId en getBoxModel y ademas tienen fallback a expresion JS.
+Segundo bug en el mismo comando: `upload css=#file-upload` fallaba con "DOM Error while querying" porque `ParseTarget` no quitaba el prefijo `css=` y el selector literal `css=#file-upload` es CSS invalido. El original JS lo acepta porque Playwright entiende el prefijo. Arreglo en `ParseTarget` (internal/engine/targets.go): se quita el prefijo `css=` en la rama CSS. Verificado: `upload css=#file-upload` -> "uploaded 1 file(s)" -> "File Uploaded!".
+Detalle de la pagina: /upload usa Dropzone; el input visible es `input#file-upload` (type=file) y hay un segundo input oculto `.dz-hidden-input` de Dropzone. El ref e5 del snapshot es el input real (boton "Seleccionar archivo"), no el area Dropzone.
+
 ## Tabla de pruebas
 | # | Comando / pagina | Resultado | Evidencia |
 |---|---|---|---|
@@ -34,3 +39,7 @@ El snapshot completo justo despues de `goto` devolvia solo `- RootWebArea [ref=e
 | B | goto reutiliza pestana (4x ejemplo.com) | PASS | Solo 3071 creada (sesion fresca); 3 gotos siguientes sin pestana nueva |
 | 0c | snapshot con solo la raiz tras goto (/drag_and_drop) | FAIL -> FIXED | Solo `- RootWebArea [ref=e1]`; reintento tambien con 1 linea; tras el arreglo el arbol completo sale en el primer intento |
 | 3 | drag (/drag_and_drop) | PASS | `drag e12 e15` -> secuencia nativa completa (dragstart/drop, dataTransfer text/html `<header>A</header>`); contenido A\|B -> B\|A, y de vuelta A\|B -> B\|A en dos drags seguidos |
+| 4 | hover (/hovers) | PASS | `hover e14` (avatar 1) -> el snapshot -i muestra el caption: heading "name: user1" + link "View profile" |
+| 5 | scroll (/infinite_scroll) | PASS | `.jscroll-added` 2 -> 3 tras 3x `scroll down`; texto de la pagina 4172 -> 6273 caracteres (ojo: los parrafos no son `<p>`, son divs) |
+| 6 | wait --text (/dynamic_loading/2) | PASS | `click e6` (Start) -> `wait --text "Hello World!" --timeout 15000` OK; `get text` muestra "Hello World!" |
+| 7 | upload (/upload) | FAIL -> FIXED | `upload e5` y `upload css=#file-upload` fallaban (nodeId 0 tras attach fresco; prefijo css= no quitado). Tras el arreglo, ambos: "uploaded 1 file(s)" -> click Upload -> "File Uploaded!" + test-upload.txt |

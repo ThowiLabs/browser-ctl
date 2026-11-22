@@ -66,7 +66,10 @@ func ParseTarget(s string) (*Target, error) {
 	} else if calls != nil {
 		return &Target{Kind: TargetLocator, Calls: calls}, nil
 	}
-	return &Target{Kind: TargetCSS, Selector: s}, nil
+	// A Playwright-style css= prefix is accepted: the JS original hands
+	// targets to Playwright, which strips it. The raw selector is what
+	// querySelector needs.
+	return &Target{Kind: TargetCSS, Selector: strings.TrimPrefix(s, "css=")}, nil
 }
 
 // parseSpaceLocator parses the space-separated locator form used on the
