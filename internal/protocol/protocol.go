@@ -74,6 +74,13 @@ const PathStatus = "/browsermcp/status"
 // PathExtension is the WebSocket path the extension connects to.
 const PathExtension = "/extension"
 
+// MaxBrowsers is how many browsers the relay accepts at once; the rest are refused
+// with CloseAnotherBrowser.
+const MaxBrowsers = 8
+
+// PausedMessage is what the extension answers when the user pressed Stop.
+const PausedMessage = "The user paused Browser MCP. Ask them to click Resume in its popup"
+
 // PairingPayload is the string the daemon signs during the handshake. It names the port we
 // listen on and the extension's challenge, so a MITM on another port can't replay a signature.
 func PairingPayload(challenge string, port int, pairingCommitment string) string {
@@ -133,22 +140,22 @@ type ExposedTab struct {
 
 // ExtensionState is the state the extension reports in hello and state events.
 type ExtensionState struct {
-	Tabs     []ExposedTab `json:"tabs"`
-	Paused   bool         `json:"paused"`
-	Pairing  string       `json:"pairing"` // "paired" | "pending"
-	Label    string       `json:"label,omitempty"`
-	FocusedAt *int64      `json:"lastFocusedAt,omitempty"`
+	Tabs      []ExposedTab `json:"tabs"`
+	Paused    bool         `json:"paused"`
+	Pairing   string       `json:"pairing"` // "paired" | "pending"
+	Label     string       `json:"label,omitempty"`
+	FocusedAt *int64       `json:"lastFocusedAt,omitempty"`
 }
 
 // Hello is the first frame the extension sends.
 type Hello struct {
-	Type             string        `json:"type"` // "hello"
-	Protocol         int           `json:"protocol"`
-	ExtensionVersion string        `json:"extensionVersion"`
-	Browser          BrowserInfo   `json:"browser"`
-	BrowserID        string        `json:"browserId,omitempty"`
-	Capabilities     []string      `json:"capabilities"`
-	Challenge        string        `json:"challenge"`
+	Type             string         `json:"type"` // "hello"
+	Protocol         int            `json:"protocol"`
+	ExtensionVersion string         `json:"extensionVersion"`
+	Browser          BrowserInfo    `json:"browser"`
+	BrowserID        string         `json:"browserId,omitempty"`
+	Capabilities     []string       `json:"capabilities"`
+	Challenge        string         `json:"challenge"`
 	State            ExtensionState `json:"state"`
 }
 
@@ -162,14 +169,43 @@ type Response struct {
 
 // Event is an event from the extension.
 type Event struct {
-	Type  string             `json:"type"` // "event"
-	Event EventPayload       `json:"event"`
+	Type  string       `json:"type"` // "event"
+	Event EventPayload `json:"event"`
 }
 
 // EventPayload is the event body.
 type EventPayload struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
+}
+
+// CDPEvent is a CDP event the extension relays from an attached tab (or a child
+// session, e.g. an out-of-process iframe, carried in SessionID).
+type CDPEvent struct {
+	TabID     int             `json:"tabId"`
+	SessionID string          `json:"sessionId,omitempty"`
+	Method    string          `json:"method"`
+	Params    json.RawMessage `json:"params,omitempty"`
+}
+
+// Detached is emitted when the browser detaches the debugger without the daemon
+// asking (reasons: "canceled_by_user", "paused", "not_allowed", or a browser reason).
+type Detached struct {
+	TabID  int    `json:"tabId"`
+	Reason string `json:"reason"`
+}
+
+// TabOpened is emitted when a page opens a tab (target=_blank / window.open).
+type TabOpened struct {
+	TabID       int    `json:"tabId"`
+	OpenerTabID int    `json:"openerTabId"`
+	URL         string `json:"url"`
+}
+
+// TabAssigned is emitted when the user drags a tab into or out of an app's group.
+type TabAssigned struct {
+	TabID int    `json:"tabId"`
+	AppID string `json:"appId"`
 }
 
 // Pong is the extension's answer to our ping.
@@ -261,7 +297,7 @@ type DetachParams struct {
 }
 
 type GroupTabParams struct {
-	TabID int     `json:"tabId"`
+	TabID int      `json:"tabId"`
 	App   *AppInfo `json:"app"`
 }
 
