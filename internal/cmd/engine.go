@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -152,12 +153,15 @@ func (e *Engine) doGoto(args string, res *commandResult) error {
 		return err
 	}
 	if e.current == 0 {
-		tabID, err := e.createTab(url)
-		if err != nil {
-			return err
+		e.current = e.findExistingTab(url)
+		if e.current == 0 {
+			tabID, err := e.createTab(url)
+			if err != nil {
+				return err
+			}
+			e.current = tabID
 		}
-		e.current = tabID
-		e.tabs[tabID] = true
+		e.tabs[e.current] = true
 	}
 	client, err := e.attach(e.current)
 	if err != nil {
@@ -170,6 +174,46 @@ func (e *Engine) doGoto(args string, res *commandResult) error {
 	time.Sleep(300 * time.Millisecond)
 	res.Output = "→ " + url
 	return nil
+}
+
+// findExistingTab returns the tab ID of an already-open tab with the same URL,
+// or 0 if none exists. This prevents creating duplicate tabs across separate
+// run invocations.
+func (e *Engine) findExistingTab(url string) int {
+	want := normalizeURLForCompare(url)
+	state := e.conn.State()
+	for _, t := range state.Tabs {
+		if normalizeURLForCompare(t.URL) == want {
+			return t.TabID
+		}
+	}
+	return 0
+}
+
+// normalizeURLForCompare canonicalizes a URL for tab matching only. It does
+// not change the URL that is navigated to. Chrome reports a root URL with a
+// trailing slash (https://example.com/) while normalizeURL keeps the form the
+// user typed (https://example.com), so a plain string comparison never
+// matched and every goto created a new tab. The original JS code acknowledged
+// the same equivalence: page.url() !== url && page.url() !== url + "/".
+func normalizeURLForCompare(s string) string {
+	s = strings.TrimSpace(s)
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return strings.TrimSuffix(s, "/")
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	if h := u.Hostname(); h != "" {
+		if (u.Scheme == "https" && u.Port() == "443") || (u.Scheme == "http" && u.Port() == "80") {
+			u.Host = h
+		}
+	}
+	u.Fragment = ""
+	if u.Path == "/" {
+		u.Path = ""
+	}
+	return u.String()
 }
 
 func (e *Engine) goHistory(delta int, res *commandResult) error {
@@ -204,7 +248,8 @@ func (e *Engine) attach(tabID int) (*cdp.Client, error) {
 	return client, nil
 }
 
-// ensureClient returns a client for the current tab, creating the tab if needed.
+// ensureClient returns a client for the current tab, reusing an existing tab
+// or creating a new one if needed.
 func (e *Engine) ensureClient() (*cdp.Client, error) {
 	state := e.conn.State()
 	if state.Paused {
@@ -214,14 +259,26 @@ func (e *Engine) ensureClient() (*cdp.Client, error) {
 		return nil, fmt.Errorf("not paired: click Allow in the extension's popup")
 	}
 	if e.current == 0 {
-		tabID, err := e.createTab("about:blank")
-		if err != nil {
-			return nil, err
+		e.current = e.findAnyExistingTab()
+		if e.current == 0 {
+			tabID, err := e.createTab("about:blank")
+			if err != nil {
+				return nil, err
+			}
+			e.current = tabID
 		}
-		e.current = tabID
-		e.tabs[tabID] = true
+		e.tabs[e.current] = true
 	}
 	return e.attach(e.current)
+}
+
+// findAnyExistingTab returns the first exposed tab ID, or 0 if none.
+func (e *Engine) findAnyExistingTab() int {
+	state := e.conn.State()
+	if len(state.Tabs) > 0 {
+		return state.Tabs[0].TabID
+	}
+	return 0
 }
 
 // --- Actions ---
