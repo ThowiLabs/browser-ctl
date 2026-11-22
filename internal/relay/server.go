@@ -35,6 +35,10 @@ type Browser struct {
 	Conn      *Connection
 	BrowserID string
 	Profile   string
+
+	// Events is an opaque hook the engine uses to receive cdpEvent / detached
+	// events for this browser (set to a *cdp.Registry by the engine).
+	Events any
 }
 
 // Server is the HTTP + WebSocket server the extension connects to.
@@ -46,9 +50,9 @@ type Server struct {
 	version    string
 	logf       func(string, ...any)
 
-	mu          sync.Mutex
-	browsers    map[string]*Browser
-	byProfile   map[string]string
+	mu        sync.Mutex
+	browsers  map[string]*Browser
+	byProfile map[string]string
 }
 
 // StartServer listens on the first free port of RelayPorts (or a fixed one if port != 0).
@@ -175,7 +179,18 @@ func (s *Server) handleExtensionWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExtensionConn(ws *websocket.Conn) {
-	var registered string
+	// Enforce the browser cap before the handshake so an 8th browser is refused
+	// with the proper close code.
+	s.mu.Lock()
+	if len(s.browsers) >= protocol.MaxBrowsers {
+		s.mu.Unlock()
+		closeCode(ws, protocol.CloseAnotherBrowser, "another browser")
+		s.logf("refused a %dth browser (max %d)", protocol.MaxBrowsers+1, protocol.MaxBrowsers)
+		return
+	}
+	s.mu.Unlock()
+
+	var registered *Browser
 	conn, err := Accept(ws, s.port, s.key, s.version,
 		func(state protocol.ExtensionState) {
 			if state.Paused {
@@ -183,12 +198,30 @@ func (s *Server) handleExtensionConn(ws *websocket.Conn) {
 			}
 		},
 		func(code int, reason string) {
-			if registered != "" {
+			if registered != nil {
 				s.mu.Lock()
-				delete(s.browsers, registered)
-				delete(s.byProfile, registered)
+				delete(s.browsers, registered.Profile)
+				delete(s.byProfile, registered.Profile)
 				s.mu.Unlock()
 				s.logf("extension disconnected: %d %s", code, reason)
+			}
+		},
+		func(tabID int, sessionID, method string, params json.RawMessage) {
+			if registered != nil {
+				if r, ok := registered.Events.(interface {
+					Dispatch(int, string, string, json.RawMessage)
+				}); ok {
+					r.Dispatch(tabID, sessionID, method, params)
+				}
+			}
+		},
+		func(tabID int, reason string) {
+			if registered != nil {
+				if r, ok := registered.Events.(interface {
+					DispatchDetached(int, string)
+				}); ok {
+					r.DispatchDetached(tabID, reason)
+				}
 			}
 		},
 	)
@@ -198,16 +231,22 @@ func (s *Server) handleExtensionConn(ws *websocket.Conn) {
 	}
 	hello := conn.Hello()
 	profile := hello.BrowserID
-	if profile == "" {
+	if profile == "" || !validBrowserID(profile) {
 		profile = hello.Browser.UserAgent
 	}
-	registered = profile
+	b := &Browser{Conn: conn, BrowserID: hello.BrowserID, Profile: profile}
+	registered = b
 	s.mu.Lock()
-	s.browsers[profile] = &Browser{Conn: conn, BrowserID: hello.BrowserID, Profile: profile}
+	s.browsers[profile] = b
 	s.byProfile[profile] = profile
 	s.mu.Unlock()
 	s.logf("extension connected: %s (profile %s, pairing %s)", hello.Browser.Name, profile, hello.State.Pairing)
 }
+
+// validBrowserID mirrors the extension's check (22 chars of [\w-]).
+var browserIDRe = regexp.MustCompile(`^[\w-]{22}$`)
+
+func validBrowserID(id string) bool { return browserIDRe.MatchString(id) }
 
 // isAllowedHost rejects other Host headers against DNS rebinding.
 func isAllowedHost(host string) bool {

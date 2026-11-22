@@ -33,24 +33,28 @@ type Connection struct {
 	port  int
 	key   *PairingKey
 
-	mu          sync.Mutex
-	closed      bool
-	nextID      int
-	pending     map[int]*pendingRequest
-	pongChans   map[int]chan bool
-	state       protocol.ExtensionState
-	pairingCode string
-	daemonNonce string
+	mu            sync.Mutex
+	closed        bool
+	nextID        int
+	pending       map[int]*pendingRequest
+	pongChans     map[int]chan bool
+	state         protocol.ExtensionState
+	pairingCode   string
+	daemonNonce   string
 	daemonVersion string
 
-	onState  func(protocol.ExtensionState)
-	onClose  func(code int, reason string)
+	onState    func(protocol.ExtensionState)
+	onClose    func(code int, reason string)
+	onCDPEvent func(tabID int, sessionID, method string, params json.RawMessage)
+	onDetached func(tabID int, reason string)
 }
 
 // Accept waits for the extension's hello, checks the protocol and answers welcome with our
 // key, a commitment to a fresh nonce and our signature of both with the challenge.
 func Accept(ws *websocket.Conn, port int, key *PairingKey, version string,
 	onState func(protocol.ExtensionState), onClose func(int, string),
+	onCDPEvent func(int, string, string, json.RawMessage),
+	onDetached func(int, string),
 ) (*Connection, error) {
 	msg, err := readFrame(ws)
 	if err != nil {
@@ -110,6 +114,8 @@ func Accept(ws *websocket.Conn, port int, key *PairingKey, version string,
 		daemonVersion: version,
 		onState:       onState,
 		onClose:       onClose,
+		onCDPEvent:    onCDPEvent,
+		onDetached:    onDetached,
 	}
 	go c.readLoop()
 	go c.pingLoop()
@@ -241,7 +247,8 @@ func (c *Connection) handleFrame(frame map[string]json.RawMessage) {
 		if err := json.Unmarshal(mustMarshal(frame), &e); err != nil {
 			return
 		}
-		if e.Event.Type == "state" {
+		switch e.Event.Type {
+		case "state":
 			var state protocol.ExtensionState
 			if err := json.Unmarshal(e.Event.Data, &state); err == nil {
 				c.mu.Lock()
@@ -250,6 +257,16 @@ func (c *Connection) handleFrame(frame map[string]json.RawMessage) {
 				if c.onState != nil {
 					c.onState(state)
 				}
+			}
+		case "cdpEvent":
+			var ev protocol.CDPEvent
+			if err := json.Unmarshal(e.Event.Data, &ev); err == nil && c.onCDPEvent != nil {
+				c.onCDPEvent(ev.TabID, ev.SessionID, ev.Method, ev.Params)
+			}
+		case "detached":
+			var d protocol.Detached
+			if err := json.Unmarshal(e.Event.Data, &d); err == nil && c.onDetached != nil {
+				c.onDetached(d.TabID, d.Reason)
 			}
 		}
 	case "pong":
