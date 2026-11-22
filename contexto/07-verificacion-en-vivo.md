@@ -17,6 +17,14 @@ Yahir vio 6 pestanas de /checkboxes (1288343065-1288343070). Investigacion:
 - Limpieza: `tab close` rechazo las duplicadas ("was not opened by this session", regla JS). Se cerraron con `tab select <id>` + `cdp Page.close` (Page.close NO esta en la lista de denegados) + wait 2000-3000 para que el estado de la extension sincronice. Las 6 pestanas cerradas y verificadas con `tabs`: quedaron solo 3049 (example.com), 3047 (chat de Yahir), 3064 (javascript_alerts) y 3071 (example.com, pestana de trabajo de la prueba).
 - Leccion para el resto de la bateria: NO reiniciar el daemon salvo en la prueba 19 (ciclo de vida), que va al final.
 
+## Hallazgo C - drag no movia nada en DnD HTML5 (BUG REAL, arreglado)
+`drag e12 e15` en /drag_and_drop devolvia exito pero el orden no cambiaba. Causa: `doDrag` (internal/engine/actions.go) enviaba `Input.dispatchMouseEvent` sin el campo `buttons`, asi que Chrome veia el raton moverse sin ningun boton pulsado y nunca iniciaba el drag HTML5. Arreglo: `mousePressed` y `mouseMoved` llevan `"buttons": 1`, `mouseReleased` lleva `"buttons": 0`.
+Verificacion: con listeners instrumentados se ve la secuencia nativa completa (mousedown, dragstart, dragenter/dragover, drop en column-b, dragend) y el dataTransfer llega con `text/html` = `<header>A</header>`; el contenido se intercambia (A|B -> B|A) y se puede intercambiar de vuelta (m17, m18 x2).
+Ojo al verificar esta pagina: la pagina intercambia innerHTML, NO el orden de los elementos; `children[0].id` siempre es `column-a` aunque el drag funcione. Hay que leer el innerText de cada columna. Los dos primeros intentos "fallidos" fueron en realidad un doble intercambio (m12 intercambio, m13 lo devolvio) leido con el chequeo equivocado.
+
+## Hallazgo D - snapshot con solo la raiz tras goto (BUG REAL, arreglado)
+El snapshot completo justo despues de `goto` devolvia solo `- RootWebArea [ref=e1]` (el arbol aun se estaba construyendo). El reintento del Hallazgo A solo disparaba con 0 lineas; ahora tambien reintenta con 1 sola linea (raiz) hasta 10x500 ms. Verificado en /drag_and_drop: tras el arreglo el snapshot trae el arbol completo en el primer intento. Coste: un snapshot de about:blank (pagina realmente vacia) tarda hasta 5 s.
+
 ## Tabla de pruebas
 | # | Comando / pagina | Resultado | Evidencia |
 |---|---|---|---|
@@ -24,3 +32,5 @@ Yahir vio 6 pestanas de /checkboxes (1288343065-1288343070). Investigacion:
 | 0b | snapshot muestra estado checked | PASS | `- checkbox [ref=e5]: false` / `[ref=e6]: true` (la 2a viene marcada por defecto en el sitio); antes no se veia el estado |
 | 1 | check/uncheck (/checkboxes) | PASS | `check e5` -> eval checked `true`; `uncheck e5` -> eval checked `false` |
 | B | goto reutiliza pestana (4x ejemplo.com) | PASS | Solo 3071 creada (sesion fresca); 3 gotos siguientes sin pestana nueva |
+| 0c | snapshot con solo la raiz tras goto (/drag_and_drop) | FAIL -> FIXED | Solo `- RootWebArea [ref=e1]`; reintento tambien con 1 linea; tras el arreglo el arbol completo sale en el primer intento |
+| 3 | drag (/drag_and_drop) | PASS | `drag e12 e15` -> secuencia nativa completa (dragstart/drop, dataTransfer text/html `<header>A</header>`); contenido A\|B -> B\|A, y de vuelta A\|B -> B\|A en dos drags seguidos |

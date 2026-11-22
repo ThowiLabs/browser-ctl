@@ -73,19 +73,22 @@ func doDrag(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if _, err := client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mousePressed", "x": from.CX, "y": from.CY, "button": "left", "clickCount": 1}); err != nil {
+	// The moves must carry buttons:1 (left held): without it Chrome
+	// sees the mouse moving with no button pressed and never starts
+	// the HTML5 drag, so the drop has no effect.
+	if _, err := client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mousePressed", "x": from.CX, "y": from.CY, "button": "left", "buttons": 1, "clickCount": 1}); err != nil {
 		return "", "", err
 	}
 	steps := 8
 	for i := 1; i <= steps; i++ {
 		x := from.CX + (to.CX-from.CX)*float64(i)/float64(steps)
 		y := from.CY + (to.CY-from.CY)*float64(i)/float64(steps)
-		if _, err := client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "left"}); err != nil {
+		if _, err := client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1}); err != nil {
 			return "", "", err
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	_, err = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseReleased", "x": to.CX, "y": to.CY, "button": "left", "clickCount": 1})
+	_, err = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseReleased", "x": to.CX, "y": to.CY, "button": "left", "buttons": 0, "clickCount": 1})
 	return "", "", err
 }
 

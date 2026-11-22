@@ -237,7 +237,9 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 		for _, r := range roots {
 			walk(r, 0)
 		}
-		if len(lines) > 0 || attempt >= 10 {
+		// A single root line means the tree is still building (a loaded page
+		// always renders more); keep retrying, same as for zero lines.
+		if len(lines) > 1 || attempt >= 10 {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
