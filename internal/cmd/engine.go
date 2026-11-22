@@ -1139,14 +1139,15 @@ func normalizeURL(s string) string {
 	if s == "" {
 		return "about:blank"
 	}
-	if !strings.Contains(s, "://") {
-		if strings.HasPrefix(s, "localhost") || strings.HasPrefix(s, "127.") {
-			s = "http://" + s
-		} else {
-			s = "https://" + s
-		}
+	// Keep URLs that already carry a scheme (https://, http://, chrome://,
+	// edge://, about:, file:, ...) untouched; only bare hostnames get a prefix.
+	if i := strings.Index(s, ":"); i > 0 && strings.HasSuffix(s[:i+1], ":") {
+		return s
 	}
-	return s
+	if strings.HasPrefix(s, "localhost") || strings.HasPrefix(s, "127.") {
+		return "http://" + s
+	}
+	return "https://" + s
 }
 
 func keyInfo(key string) (info struct {
