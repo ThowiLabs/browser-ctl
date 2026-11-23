@@ -107,26 +107,33 @@ func doSnapshot(ctx *Context) (string, string, error) {
 // order for locator resolution.
 func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (string, map[string]string, map[string]int, []AXEntry, error) {
 	// Frame tree first, so refs in iframes get the f<index> prefix.
-	frameIndex := map[string]int{}
+	// The child list is "childFrames" (nested); flatten it in document
+	// order: main frame first (index 0), then each child frame.
+	type frameTreeNode struct {
+		Frame struct {
+			ID string `json:"id"`
+		} `json:"frame"`
+		ChildFrames []frameTreeNode `json:"childFrames"`
+	}
+	frameIDs := []string{}
 	if raw, err := client.Call("Page.getFrameTree", map[string]any{}); err == nil {
 		var tree struct {
-			FrameTree struct {
-				Frame struct {
-					ID string `json:"id"`
-				} `json:"frame"`
-				ChildFrameTree []struct {
-					Frame struct {
-						ID string `json:"id"`
-					} `json:"frame"`
-				} `json:"childFrameTree"`
-			} `json:"frameTree"`
+			FrameTree frameTreeNode `json:"frameTree"`
 		}
 		if json.Unmarshal(raw, &tree) == nil {
-			frameIndex[tree.FrameTree.Frame.ID] = 0
-			for i, cf := range tree.FrameTree.ChildFrameTree {
-				frameIndex[cf.Frame.ID] = i + 1
+			var flatten func(n frameTreeNode)
+			flatten = func(n frameTreeNode) {
+				frameIDs = append(frameIDs, n.Frame.ID)
+				for _, c := range n.ChildFrames {
+					flatten(c)
+				}
 			}
+			flatten(tree.FrameTree)
 		}
+	}
+	if len(frameIDs) == 0 {
+		// No frame tree: still fetch the main frame's AX tree.
+		frameIDs = []string{""}
 	}
 	// No depth param: CDP treats an explicit depth of 0 as a shallow
 	// tree (root + 2 levels). Omitting it returns the full tree.
@@ -138,47 +145,73 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 	var ax []AXEntry
 	var lines []string
 	for attempt := 0; ; attempt++ {
-		raw, err := client.Call("Accessibility.getFullAXTree", map[string]any{})
-		if err != nil {
-			return "", nil, nil, nil, err
+		// One AX tree per frame: getFullAXTree without a frameId only
+		// covers the main frame, so iframe contents need their own
+		// call. A child frame that fails to answer is skipped, not
+		// fatal: the main tree is what the snapshot needs.
+		type axFrame struct {
+			byID  map[string]*axNode
+			roots []*axNode
 		}
-		var res struct {
-			Nodes []axNode `json:"nodes"`
-		}
-		if err := json.Unmarshal(raw, &res); err != nil {
-			return "", nil, nil, nil, err
-		}
-		byID := map[string]*axNode{}
-		for i := range res.Nodes {
-			byID[res.Nodes[i].NodeID] = &res.Nodes[i]
-		}
-		// Find the root (node with no parent).
-		isChild := map[string]bool{}
-		for _, n := range res.Nodes {
-			for _, c := range n.ChildIDs {
-				isChild[c] = true
+		var frames []axFrame
+		for i, fid := range frameIDs {
+			params := map[string]any{}
+			if i > 0 {
+				params["frameId"] = fid
 			}
-		}
-		var roots []*axNode
-		for i := range res.Nodes {
-			if !isChild[res.Nodes[i].NodeID] {
-				roots = append(roots, &res.Nodes[i])
+			raw, err := client.Call("Accessibility.getFullAXTree", params)
+			if err != nil {
+				if i == 0 {
+					return "", nil, nil, nil, err
+				}
+				continue
 			}
+			var res struct {
+				Nodes []axNode `json:"nodes"`
+			}
+			if err := json.Unmarshal(raw, &res); err != nil {
+				if i == 0 {
+					return "", nil, nil, nil, err
+				}
+				continue
+			}
+			byID := map[string]*axNode{}
+			for j := range res.Nodes {
+				byID[res.Nodes[j].NodeID] = &res.Nodes[j]
+			}
+			// Find the root (node with no parent).
+			isChild := map[string]bool{}
+			for _, n := range res.Nodes {
+				for _, c := range n.ChildIDs {
+					isChild[c] = true
+				}
+			}
+			var roots []*axNode
+			for j := range res.Nodes {
+				if !isChild[res.Nodes[j].NodeID] {
+					roots = append(roots, &res.Nodes[j])
+				}
+			}
+			frames = append(frames, axFrame{byID: byID, roots: roots})
+		}
+		if len(frames) == 0 {
+			return "", nil, nil, nil, fmt.Errorf("snapshot: no AX tree")
 		}
 		refs = map[string]string{}
 		nodes = map[string]int{}
 		ax = nil
 		next := 1
 		lines = nil
-		var walk func(n *axNode, level int)
-		walk = func(n *axNode, level int) {
+		iframeSeen := 0
+		var walk func(n *axNode, level int, byID map[string]*axNode, frameIdx int)
+		walk = func(n *axNode, level int, byID map[string]*axNode, frameIdx int) {
 			if depth > 0 && level > depth {
 				return
 			}
 			if n.Ignored {
 				for _, c := range n.ChildIDs {
 					if child, ok := byID[c]; ok {
-						walk(child, level)
+						walk(child, level, byID, frameIdx)
 					}
 				}
 				return
@@ -199,8 +232,11 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 			if !interactive || keep {
 				// Only interactive/named nodes get refs.
 				if role != "StaticText" && role != "generic" {
-					if idx, ok := frameIndex[n.FrameID]; ok && idx > 0 {
-						ref = fmt.Sprintf("f%de%d", idx, next)
+					// The frame index comes from the tree being walked:
+					// only the root of a frame's AX tree carries its
+					// frameId, its descendants do not.
+					if frameIdx > 0 {
+						ref = fmt.Sprintf("f%de%d", frameIdx, next)
 					} else {
 						ref = fmt.Sprintf("e%d", next)
 					}
@@ -228,14 +264,24 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 				}
 				lines = append(lines, line)
 			}
+			// An iframe's content lives in its own AX tree: walk it
+			// nested under the iframe element (Nth iframe in the main
+			// tree is the Nth child frame).
+			if role == "Iframe" && iframeSeen < len(frames)-1 {
+				iframeSeen++
+				child := frames[iframeSeen]
+				for _, r := range child.roots {
+					walk(r, level+1, child.byID, iframeSeen)
+				}
+			}
 			for _, c := range n.ChildIDs {
 				if child, ok := byID[c]; ok {
-					walk(child, level+1)
+					walk(child, level+1, byID, frameIdx)
 				}
 			}
 		}
-		for _, r := range roots {
-			walk(r, 0)
+		for _, r := range frames[0].roots {
+			walk(r, 0, frames[0].byID, 0)
 		}
 		// A single root line means the tree is still building (a loaded page
 		// always renders more); keep retrying, same as for zero lines.
