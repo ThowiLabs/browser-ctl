@@ -326,6 +326,9 @@ func doTab(ctx *Context) (string, string, error) {
 		sess.mu.Lock()
 		sess.Current = id
 		sess.Tabs[id] = true
+		// Adoptar la pestaña también le da propiedad para cerrarla:
+		// sin esto una pestaña adoptada no se puede cerrar nunca.
+		sess.Opened[id] = true
 		sess.mu.Unlock()
 		// Adopting a user's tab groups it (unless pinned — the extension
 		// handles that).
