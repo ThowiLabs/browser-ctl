@@ -109,6 +109,9 @@ type RequestEntry struct {
 	URL     string `json:"url"`
 	Status  int    `json:"status,omitempty"`
 	Failure string `json:"failure,omitempty"`
+	// CDP request id (Network.requestWillBeSent): needed to fetch the
+	// response body later with Network.getResponseBody.
+	CDPID string `json:"cdpId,omitempty"`
 }
 
 // Dialog is an open JS dialog.

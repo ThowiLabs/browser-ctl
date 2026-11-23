@@ -111,7 +111,7 @@ func (e *Engine) captureEvent(ts *TabState, method string, params json.RawMessag
 			return
 		}
 		id := len(ts.Requests) + 1
-		ts.Requests = appendCapped(ts.Requests, RequestEntry{ID: id, Method: ev.Request.Method, URL: ev.Request.URL})
+		ts.Requests = appendCapped(ts.Requests, RequestEntry{ID: id, Method: ev.Request.Method, URL: ev.Request.URL, CDPID: ev.RequestID})
 	case "Network.responseReceived":
 		var ev struct {
 			RequestID string `json:"requestId"`
@@ -122,11 +122,21 @@ func (e *Engine) captureEvent(ts *TabState, method string, params json.RawMessag
 		if json.Unmarshal(params, &ev) != nil {
 			return
 		}
-		// Match by order: the last request without a status.
-		for i := len(ts.Requests) - 1; i >= 0; i-- {
-			if ts.Requests[i].Status == 0 {
+		// Match by CDP request id; fall back to order (last without status).
+		matched := false
+		for i := range ts.Requests {
+			if ts.Requests[i].CDPID == ev.RequestID && ts.Requests[i].Status == 0 {
 				ts.Requests[i].Status = ev.Response.Status
+				matched = true
 				break
+			}
+		}
+		if !matched {
+			for i := len(ts.Requests) - 1; i >= 0; i-- {
+				if ts.Requests[i].Status == 0 {
+					ts.Requests[i].Status = ev.Response.Status
+					break
+				}
 			}
 		}
 	case "Network.loadingFailed":
@@ -138,10 +148,20 @@ func (e *Engine) captureEvent(ts *TabState, method string, params json.RawMessag
 		if json.Unmarshal(params, &ev) != nil {
 			return
 		}
-		for i := len(ts.Requests) - 1; i >= 0; i-- {
-			if ts.Requests[i].Failure == "" {
+		matched := false
+		for i := range ts.Requests {
+			if ts.Requests[i].CDPID == ev.RequestID && ts.Requests[i].Failure == "" {
 				ts.Requests[i].Failure = ev.ErrorText
+				matched = true
 				break
+			}
+		}
+		if !matched {
+			for i := len(ts.Requests) - 1; i >= 0; i-- {
+				if ts.Requests[i].Failure == "" {
+					ts.Requests[i].Failure = ev.ErrorText
+					break
+				}
 			}
 		}
 	case "Page.javascriptDialogOpening":

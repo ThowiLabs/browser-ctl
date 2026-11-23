@@ -177,7 +177,11 @@ func doGoto(ctx *Context) (string, string, error) {
 	sess := ctx.Session
 	tabID := e.CurrentTab(sess)
 	if tabID == 0 {
-		id, err := e.backend.CreateTab(url, e.app)
+		// Create the tab blank, claim it first (so console/request/CDP
+		// event listeners are in place), then navigate: creating it
+		// already at the URL loads the page before anyone listens and
+		// the load requests never reach the buffers.
+		id, err := e.backend.CreateTab("about:blank", e.app)
 		if err != nil {
 			return "", "", err
 		}
@@ -186,6 +190,16 @@ func doGoto(ctx *Context) (string, string, error) {
 		sess.Tabs[id] = true
 		sess.Opened[id] = true
 		sess.mu.Unlock()
+		client, _, err := e.ensureClient(sess)
+		if err != nil {
+			return "", "", err
+		}
+		if _, err := client.Call("Page.navigate", map[string]any{"url": url}); err != nil {
+			return "", "", err
+		}
+		if err := waitForLoad(client, 10*time.Second); err != nil {
+			return "", "", err
+		}
 		return "→ " + url, "", nil
 	}
 	client, _, err := e.ensureClient(sess)

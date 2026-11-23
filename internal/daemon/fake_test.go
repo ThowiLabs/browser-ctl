@@ -104,6 +104,10 @@ func (f *fakeExtension) answer(method string, params json.RawMessage) any {
 			URL string `json:"url"`
 		}
 		_ = json.Unmarshal(params, &p)
+		// Like the real extension, the new tab joins the tab registry
+		// and a state event pushes it (CreateTab waits for it).
+		f.tabs = append(f.tabs, map[string]any{"tabId": 102, "windowId": 1, "url": p.URL, "title": "", "active": true, "pinned": false})
+		_ = f.ws.WriteJSON(map[string]any{"type": "event", "event": map[string]any{"type": "state", "data": map[string]any{"tabs": f.tabs, "paused": false, "pairing": "paired"}}})
 		return map[string]any{"tabId": 102}
 	case "attach":
 		return map[string]any{"targetInfo": map[string]any{"targetId": "fake-target", "type": "page", "url": "https://example.com/", "title": "Example"}}

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/thovilabs/browser-ctl/internal/cdp"
 )
 
 func doGet(ctx *Context) (string, string, error) {
@@ -307,7 +309,7 @@ func doRequests(ctx *Context) (string, string, error) {
 }
 
 func doRequest(ctx *Context) (string, string, error) {
-	_, ts, err := ctx.Engine.ensureClient(ctx.Session)
+	client, ts, err := ctx.Engine.ensureClient(ctx.Session)
 	if err != nil {
 		return "", "", err
 	}
@@ -318,8 +320,38 @@ func doRequest(ctx *Context) (string, string, error) {
 			if r.Failure != "" {
 				out += "\nfailure: " + r.Failure
 			}
+			if _, wantBody := ctx.Flags["body"]; wantBody {
+				max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
+				out += "\n" + requestBody(client, r.CDPID, max)
+			}
 			return out, "", nil
 		}
 	}
 	return "", "", fmt.Errorf("no request #%d", id)
+}
+
+// requestBody fetches a recorded request's response body with
+// Network.getResponseBody (the CDP request id is recorded at
+// requestWillBeSent). Bodies of failed or long-finished requests may
+// already be gone; that is reported, not an error.
+func requestBody(client *cdp.Client, cdpID string, max int) string {
+	if cdpID == "" {
+		return "(body unavailable: request id not recorded)"
+	}
+	raw, err := client.Call("Network.getResponseBody", map[string]any{"requestId": cdpID})
+	if err != nil {
+		return "(body unavailable: " + err.Error() + ")"
+	}
+	var res struct {
+		Body          string `json:"body"`
+		Base64Encoded bool   `json:"base64Encoded"`
+	}
+	_ = json.Unmarshal(raw, &res)
+	body := res.Body
+	if res.Base64Encoded {
+		if b, err := base64.StdEncoding.DecodeString(body); err == nil {
+			body = string(b)
+		}
+	}
+	return cap(body, max)
 }
