@@ -203,15 +203,23 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 		next := 1
 		lines = nil
 		iframeSeen := 0
-		var walk func(n *axNode, level int, byID map[string]*axNode, frameIdx int)
-		walk = func(n *axNode, level int, byID map[string]*axNode, frameIdx int) {
+		var walk func(n *axNode, level int, byID map[string]*axNode, frameIdx int, nearestBackend int)
+		walk = func(n *axNode, level int, byID map[string]*axNode, frameIdx int, nearestBackend int) {
 			if depth > 0 && level > depth {
 				return
+			}
+			// A node without its own DOM counterpart (e.g. an
+			// InlineTextBox, whose AX id is synthetic) inherits the
+			// nearest ancestor's backend node id, so refs to text
+			// nodes still resolve precisely (click/get) instead of
+			// falling back to a querySelector that misses.
+			if n.BackendDOMNodeID != 0 {
+				nearestBackend = n.BackendDOMNodeID
 			}
 			if n.Ignored {
 				for _, c := range n.ChildIDs {
 					if child, ok := byID[c]; ok {
-						walk(child, level, byID, frameIdx)
+						walk(child, level, byID, frameIdx, nearestBackend)
 					}
 				}
 				return
@@ -242,8 +250,8 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 					}
 					next++
 					refs[ref] = axNodeExpr(n)
-					if n.BackendDOMNodeID != 0 {
-						nodes[ref] = n.BackendDOMNodeID
+					if nearestBackend != 0 {
+						nodes[ref] = nearestBackend
 					}
 					ax = append(ax, AXEntry{Ref: ref, Role: role, Name: name, Value: n.Value.Value, BackendID: n.BackendDOMNodeID})
 				}
@@ -271,17 +279,17 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 				iframeSeen++
 				child := frames[iframeSeen]
 				for _, r := range child.roots {
-					walk(r, level+1, child.byID, iframeSeen)
+					walk(r, level+1, child.byID, iframeSeen, 0)
 				}
 			}
 			for _, c := range n.ChildIDs {
 				if child, ok := byID[c]; ok {
-					walk(child, level+1, byID, frameIdx)
+					walk(child, level+1, byID, frameIdx, nearestBackend)
 				}
 			}
 		}
 		for _, r := range frames[0].roots {
-			walk(r, 0, frames[0].byID, 0)
+			walk(r, 0, frames[0].byID, 0, 0)
 		}
 		// A single root line means the tree is still building (a loaded page
 		// always renders more); keep retrying, same as for zero lines.

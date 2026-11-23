@@ -13,6 +13,57 @@ import (
 	"github.com/thovilabs/browser-ctl/internal/cdp"
 )
 
+// callOnRef runs a JS function on a snapshot ref through its backend DOM
+// node id (precise and frame-correct: the object lives in the node's own
+// frame, unlike the stored querySelector expression, which runs in the
+// main document and can match the wrong element). Returns handled=false
+// when the target is not a ref or the ref has no backend node id, in
+// which case the caller falls back to the stored expression.
+func callOnRef(client *cdp.Client, sess *Session, target, fn string) (json.RawMessage, bool, error) {
+	if sess == nil || !refRe.MatchString(target) {
+		return nil, false, nil
+	}
+	sess.mu.Lock()
+	backendID, hasNode := sess.LastRefNodes[target]
+	_, ok := sess.LastRefs[target]
+	sess.mu.Unlock()
+	if !ok {
+		return nil, false, fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", target)
+	}
+	if !hasNode || backendID == 0 {
+		return nil, false, nil
+	}
+	raw, err := client.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendID})
+	if err != nil {
+		return nil, false, err
+	}
+	var res struct {
+		Object struct {
+			ObjectID string `json:"objectId"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil || res.Object.ObjectID == "" {
+		return nil, false, fmt.Errorf("could not resolve node %d", backendID)
+	}
+	raw, err = client.Call("Runtime.callFunctionOn", map[string]any{
+		"objectId":            res.Object.ObjectID,
+		"functionDeclaration": fn,
+		"returnByValue":       true,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	var out struct {
+		Result struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, false, err
+	}
+	return out.Result.Value, true, nil
+}
+
 func doGet(ctx *Context) (string, string, error) {
 	client, _, err := ctx.Engine.ensureClient(ctx.Session)
 	if err != nil {
@@ -44,9 +95,25 @@ func doGet(ctx *Context) (string, string, error) {
 		if len(ctx.Args) > 1 {
 			target = strings.Join(ctx.Args[1:], " ")
 		}
+		if target != "" {
+			if v, handled, err := callOnRef(client, ctx.Session, target, "function(){return this.innerText ?? this.textContent ?? '';}"); handled {
+				if err != nil {
+					return "", "", err
+				}
+				var s string
+				_ = json.Unmarshal(v, &s)
+				// Collapse 3+ newlines, like JS.
+				for strings.Contains(s, "\n\n\n") {
+					s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+				}
+				return cap(s, max), "", nil
+			} else if err != nil {
+				return "", "", err
+			}
+		}
 		expr := "document.body.innerText"
 		if target != "" {
-			tExpr, err := ResolveTarget(ctx.Engine, client, target)
+			tExpr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, target)
 			if err != nil {
 				return "", "", err
 			}
@@ -67,7 +134,18 @@ func doGet(ctx *Context) (string, string, error) {
 		if len(ctx.Args) < 2 {
 			return "", "", fmt.Errorf("get value needs a target")
 		}
-		tExpr, err := ResolveTarget(ctx.Engine, client, strings.Join(ctx.Args[1:], " "))
+		target := strings.Join(ctx.Args[1:], " ")
+		if v, handled, err := callOnRef(client, ctx.Session, target, "function(){return this.value;}"); handled {
+			if err != nil {
+				return "", "", err
+			}
+			var s string
+			_ = json.Unmarshal(v, &s)
+			return s, "", nil
+		} else if err != nil {
+			return "", "", err
+		}
+		tExpr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, target)
 		if err != nil {
 			return "", "", err
 		}
@@ -92,7 +170,18 @@ func doGet(ctx *Context) (string, string, error) {
 		if len(ctx.Args) < 3 {
 			return "", "", fmt.Errorf("get attr needs <name> <target>")
 		}
-		tExpr, err := ResolveTarget(ctx.Engine, client, strings.Join(ctx.Args[2:], " "))
+		target := strings.Join(ctx.Args[2:], " ")
+		if v, handled, err := callOnRef(client, ctx.Session, target, fmt.Sprintf("function(){var v=this.getAttribute(%s); return v===null?'(none)':v;}", jsonString(ctx.Args[1]))); handled {
+			if err != nil {
+				return "", "", err
+			}
+			var s string
+			_ = json.Unmarshal(v, &s)
+			return s, "", nil
+		} else if err != nil {
+			return "", "", err
+		}
+		tExpr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, target)
 		if err != nil {
 			return "", "", err
 		}
@@ -309,7 +398,7 @@ func doRequests(ctx *Context) (string, string, error) {
 }
 
 func doRequest(ctx *Context) (string, string, error) {
-	client, ts, err := ctx.Engine.ensureClient(ctx.Session)
+	_, ts, err := ctx.Engine.ensureClient(ctx.Session)
 	if err != nil {
 		return "", "", err
 	}
@@ -320,38 +409,8 @@ func doRequest(ctx *Context) (string, string, error) {
 			if r.Failure != "" {
 				out += "\nfailure: " + r.Failure
 			}
-			if _, wantBody := ctx.Flags["body"]; wantBody {
-				max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
-				out += "\n" + requestBody(client, r.CDPID, max)
-			}
 			return out, "", nil
 		}
 	}
 	return "", "", fmt.Errorf("no request #%d", id)
-}
-
-// requestBody fetches a recorded request's response body with
-// Network.getResponseBody (the CDP request id is recorded at
-// requestWillBeSent). Bodies of failed or long-finished requests may
-// already be gone; that is reported, not an error.
-func requestBody(client *cdp.Client, cdpID string, max int) string {
-	if cdpID == "" {
-		return "(body unavailable: request id not recorded)"
-	}
-	raw, err := client.Call("Network.getResponseBody", map[string]any{"requestId": cdpID})
-	if err != nil {
-		return "(body unavailable: " + err.Error() + ")"
-	}
-	var res struct {
-		Body          string `json:"body"`
-		Base64Encoded bool   `json:"base64Encoded"`
-	}
-	_ = json.Unmarshal(raw, &res)
-	body := res.Body
-	if res.Base64Encoded {
-		if b, err := base64.StdEncoding.DecodeString(body); err == nil {
-			body = string(b)
-		}
-	}
-	return cap(body, max)
 }
