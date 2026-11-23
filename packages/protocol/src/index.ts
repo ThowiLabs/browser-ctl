@@ -272,6 +272,11 @@ export type ExtensionRequestMap = {
   };
   /** Reports which app acted last, for the toolbar badge's color */
   activity: { params: { appId: string }; result: void };
+  /** Moves the cursor overlay the content script draws (or hides it with `visible: false`) */
+  cursor: {
+    params: { tabId: number; x: number; y: number; visible: boolean };
+    result: void;
+  };
 };
 
 export type ExtensionRequestMethod = keyof ExtensionRequestMap;

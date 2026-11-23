@@ -119,7 +119,7 @@ func Attach(conn *relay.Connection, tabID int) (*Client, error) {
 	}
 	c := &Client{conn: conn, tabID: tabID, target: t, eventCh: make(chan event, 64), done: make(chan struct{})}
 	// Best-effort enable of the domains the command engine relies on.
-	for _, domain := range []string{"Runtime", "Page", "DOM", "Network", "Log", "Target"} {
+	for _, domain := range []string{"Runtime", "Page", "DOM", "Network", "Log", "Target", "Overlay"} {
 		c.Call(domain+".enable", map[string]any{})
 	}
 	return c, nil
@@ -127,6 +127,15 @@ func Attach(conn *relay.Connection, tabID int) (*Client, error) {
 
 // TabID returns the browser tab this client is attached to.
 func (c *Client) TabID() int { return c.tabID }
+
+// SendCursor tells the extension's content script where to draw the
+// cursor overlay (or hides it with visible=false). The extension
+// answers "Unknown request" when it predates the cursor method, so the
+// caller falls back to the Runtime.evaluate overlay (task 10).
+func (c *Client) SendCursor(x, y float64, visible bool) error {
+	_, err := c.conn.Request("cursor", protocol.CursorParams{TabID: c.tabID, X: x, Y: y, Visible: visible})
+	return err
+}
 
 // Target returns the CDP target info.
 func (c *Client) Target() Target { return c.target }

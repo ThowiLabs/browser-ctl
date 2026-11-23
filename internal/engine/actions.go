@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,8 @@ func doClick(ctx *Context) (string, string, error) {
 	if dbl {
 		clickCount = 2
 	}
+	highlightTarget(ctx.Engine, client, ctx.Session, ctx.Args[0])
+	defer hideHighlight(client)
 	before := currentURL(ctx.Engine, client)
 	moveCursor(ctx.Session, client, box.CX, box.CY, true)
 	// Brief pause on arrival, like a human hand settling before the press.
@@ -56,7 +59,12 @@ func doHover(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	highlightTarget(ctx.Engine, client, ctx.Session, ctx.Args[0])
 	moveCursor(ctx.Session, client, box.CX, box.CY, true)
+	// El resaltado se queda un momento para que se vea dónde quedó la
+	// mano; luego se quita para no dejarlo fijo en la página.
+	time.Sleep(700 * time.Millisecond)
+	hideHighlight(client)
 	return "", "", nil
 }
 
@@ -73,6 +81,8 @@ func doDrag(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	highlightTarget(ctx.Engine, client, ctx.Session, ctx.Args[0])
+	defer hideHighlight(client)
 	// The moves must carry buttons:1 (left held): without it Chrome
 	// sees the mouse moving with no button pressed and never starts
 	// the HTML5 drag, so the drop has no effect.
@@ -504,25 +514,42 @@ func settleAfterAction(client *cdp.Client, before string) {
 	}
 }
 
-// moveCursor glides the on-page cursor overlay to the point the way a
-// human hand would: a gently curved path (quadratic bezier, pushed a
-// little to one side) with ease-in-out timing — slow start, fast middle,
-// slow landing — instead of a straight-line teleport. The real mouse
-// follows the same path with mouseMoved events when emit is true, so
-// hover effects trigger along the way; drag passes false for the final
-// glide because the real mouse already travelled there in steps.
-// The overlay is the JS original's: a big blue SVG arrow with glow and
-// a pill label, living in a closed shadow root so it never leaks into
-// innerText or snapshots. The last position is kept on the session, so
-// the next move starts where the hand was left.
+// moveCursor glides the cursor to the point the way a human hand
+// would: a gently curved path (quadratic bezier, pushed a little to one
+// side) with ease-in-out timing, a small overshoot past the target and a
+// corrective glide back (ballistic-corrective model), light tremor on
+// each step and variable durations — never the same clean timing twice.
+// The overlay itself lives in the extension's content script (isolated
+// world, random host id, removed when idle); the engine only sends
+// positions. The real mouse follows the same path with mouseMoved
+// events when emit is true, so hover effects trigger along the way;
+// drag passes false for the final glide because the real mouse already
+// travelled there in steps. While the loaded extension predates the
+// cursor method, the task-10 overlay (Runtime.evaluate) is the fallback
+// for that step, so the cursor never disappears; both overlays are
+// never drawn at once.
 func moveCursor(sess *Session, client *cdp.Client, x, y float64, emit bool) {
 	sess.mu.Lock()
 	sx, sy, known := sess.CursorX, sess.CursorY, sess.CursorKnown
 	sess.mu.Unlock()
-	setCursorPos(client, x, y)
+	// put sends one overlay position to the extension; on the first
+	// failure of this move it falls back to the task-10 overlay for
+	// the rest of the move, and the next move tries the extension
+	// again (the extension may have been reloaded meanwhile).
+	extOK := true
+	put := func(px, py float64) {
+		if extOK {
+			if err := client.SendCursor(px, py, true); err == nil {
+				return
+			}
+			extOK = false
+		}
+		setCursorPos(client, px, py)
+	}
 	if !known {
 		// No start point yet, so no glide — but the real mouse must
 		// still be told where it is, or :hover never triggers.
+		put(x, y)
 		if emit {
 			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "none"})
 		}
@@ -534,6 +561,7 @@ func moveCursor(sess *Session, client *cdp.Client, x, y float64, emit bool) {
 	dx, dy := x-sx, y-sy
 	dist := math.Hypot(dx, dy)
 	if dist < 2 {
+		put(x, y)
 		if emit {
 			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "none"})
 		}
@@ -554,7 +582,7 @@ func moveCursor(sess *Session, client *cdp.Client, x, y float64, emit bool) {
 	if steps > 24 {
 		steps = 24
 	}
-	dur := 200 + dist*0.6
+	dur := (200 + dist*0.6) * (0.9 + rand.Float64()*0.2)
 	if dur < 250 {
 		dur = 250
 	}
@@ -562,24 +590,66 @@ func moveCursor(sess *Session, client *cdp.Client, x, y float64, emit bool) {
 		dur = 700
 	}
 	pause := time.Duration(dur/float64(steps)) * time.Millisecond
+	// glide sends one path point: overlay position + real mouseMoved.
+	glide := func(bx, by float64) {
+		put(bx, by)
+		if emit {
+			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": bx, "y": by, "button": "none"})
+		}
+	}
 	for i := 1; i <= steps; i++ {
 		t := float64(i) / float64(steps)
 		e := easeInOutCubic(t)
 		bx := (1-e)*(1-e)*sx + 2*(1-e)*e*cx + e*e*x
 		by := (1-e)*(1-e)*sy + 2*(1-e)*e*cy + e*e*y
-		setCursorPos(client, bx, by)
-		if emit {
-			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": bx, "y": by, "button": "none"})
+		// Light tremor: a human hand never holds a perfect curve.
+		// The landing point itself is never jittered.
+		if i < steps {
+			bx += clampJitter(rand.NormFloat64() * 1.2)
+			by += clampJitter(rand.NormFloat64() * 1.2)
 		}
+		glide(bx, by)
 		time.Sleep(pause)
 	}
-	setCursorPos(client, x, y)
+	// Overshoot past the target, then correct back: a hand rarely
+	// lands exactly on the point on the first try.
+	over := 0.04 * dist
+	if over < 2 {
+		over = 2
+	}
+	if over > 10 {
+		over = 10
+	}
+	ux, uy := dx/dist, dy/dist
+	ox, oy := x+ux*over, y+uy*over
+	for i := 1; i <= 3; i++ {
+		t := float64(i) / 3
+		glide(x+(ox-x)*t, y+(oy-y)*t)
+		time.Sleep(30 * time.Millisecond)
+	}
+	for i := 1; i <= 3; i++ {
+		t := float64(i) / 3
+		glide(ox+(x-ox)*t, oy+(y-oy)*t)
+		time.Sleep(30 * time.Millisecond)
+	}
+	put(x, y)
 	if emit {
 		_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "none"})
 	}
 	sess.mu.Lock()
 	sess.CursorX, sess.CursorY = x, y
 	sess.mu.Unlock()
+}
+
+// clampJitter keeps the tremor small: never more than 3 px off the path.
+func clampJitter(v float64) float64 {
+	if v > 3 {
+		return 3
+	}
+	if v < -3 {
+		return -3
+	}
+	return v
 }
 
 func easeInOutCubic(t float64) float64 {
@@ -592,6 +662,9 @@ func easeInOutCubic(t float64) float64 {
 // setCursorPos creates the cursor overlay once and moves it to (x, y).
 // Same look as the JS original: blue SVG arrow with glow + pill label,
 // in a closed shadow root on <html>, aria-hidden and pointer-events none.
+// Fallback only, while the loaded extension predates the cursor method:
+// moveCursor uses the extension's content script first, and this only
+// when that fails, so both overlays are never drawn at once.
 func setCursorPos(client *cdp.Client, x, y float64) {
 	js := fmt.Sprintf(`(function(){var id='browser-ctl-cursor';var host=document.getElementById(id);if(!host){host=document.createElement('div');host.id=id;host.setAttribute('aria-hidden','true');host.style.cssText='position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;';host.attachShadow({mode:'closed'}).innerHTML='<style>.arrow{position:absolute;left:-3px;top:-3px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45)) drop-shadow(0 0 6px rgba(37,99,235,.9));}.label{position:absolute;left:22px;top:26px;padding:3px 9px;border-radius:999px;background:#2563eb;color:#fff;font:600 12px/16px system-ui,-apple-system,sans-serif;white-space:nowrap;border:1.5px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35);}</style><svg class="arrow" width="30" height="36" viewBox="0 0 20 24"><path d="M1 1 L1 19 L6 14.5 L9.5 22 L12.5 20.7 L9 13.3 L15.5 13 Z" fill="#2563eb" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg><div class="label">browser-ctl</div>';document.documentElement.appendChild(host);}host.style.transform='translate(%vpx, %vpx)';})()`, x, y)
 	_, _ = client.Call("Runtime.evaluate", map[string]any{"expression": js})

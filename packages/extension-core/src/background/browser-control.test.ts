@@ -765,6 +765,83 @@ describe("another extension's frame blocking attaching", () => {
   });
 });
 
+describe("the cursor overlay", () => {
+  /**
+   * Like `startPaired`, but this fork auto-pairs: the status is already
+   * "paired" after welcome, so there is no "pending" state to wait for
+   * (the upstream `startPaired` times out here).
+   */
+  async function startAutoPaired() {
+    const started = await start();
+    const key = await createDaemonKey();
+    await welcome(started.ws, key);
+    await vi.waitFor(async () =>
+      expect(await connectionStatusItem.getValue()).toMatchObject({
+        state: "connected",
+        pairing: "paired",
+      }),
+    );
+    return started;
+  }
+
+  it("forwards the position to the main frame's content script", async () => {
+    chrome.addTab({ id: 1 });
+    const { ws } = await startAutoPaired();
+    const sendMessage = vi.fn(async () => undefined);
+    Object.assign(fakeBrowser.tabs, { sendMessage });
+
+    expect(
+      (
+        await request(ws, {
+          method: "cursor",
+          params: { tabId: 1, x: 120, y: 80, visible: true },
+        })
+      ).error,
+    ).toBeUndefined();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      1,
+      { type: "browser-ctl:cursor", x: 120, y: 80, visible: true },
+      { frameId: 0 },
+    );
+  });
+
+  it("hides the overlay on visible: false", async () => {
+    chrome.addTab({ id: 1 });
+    const { ws } = await startAutoPaired();
+    const sendMessage = vi.fn(async () => undefined);
+    Object.assign(fakeBrowser.tabs, { sendMessage });
+
+    expect(
+      (
+        await request(ws, {
+          method: "cursor",
+          params: { tabId: 1, x: 0, y: 0, visible: false },
+        })
+      ).error,
+    ).toBeUndefined();
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      1,
+      { type: "browser-ctl:cursor", x: 0, y: 0, visible: false },
+      { frameId: 0 },
+    );
+  });
+
+  it("refuses a tab agents may not use", async () => {
+    const { ws } = await startAutoPaired();
+    expect(
+      (
+        await request(ws, {
+          method: "cursor",
+          params: { tabId: 9, x: 1, y: 1, visible: true },
+        })
+      ).error,
+    ).toMatch(/doesn't exist/);
+  });
+});
+
 describe("what the daemon can't reach through an attached tab", () => {
   it("refuses CDP commands that reach other sites or tabs, and navigating to browser pages", async () => {
     chrome.addTab({ id: 1 });

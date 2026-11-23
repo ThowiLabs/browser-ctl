@@ -284,6 +284,16 @@ type CreateTabResult struct {
 	TabID int `json:"tabId"`
 }
 
+// CursorParams moves the cursor overlay the extension's content script
+// draws (or hides it with Visible=false). Fire-and-forget from the
+// engine: the background forwards it to the tab's content script.
+type CursorParams struct {
+	TabID   int     `json:"tabId"`
+	X       float64 `json:"x"`
+	Y       float64 `json:"y"`
+	Visible bool    `json:"visible"`
+}
+
 type CloseTabParams struct {
 	TabID int `json:"tabId"`
 }

@@ -34,6 +34,7 @@ import type {
   ConnectionStatus,
 } from "../types";
 import { updateBadge } from "./badge";
+import { CURSOR_MESSAGE } from "../content";
 import { getDeniedCdpMessage, getNavigationUrl } from "./cdp-policy";
 import { RelayConnection, type Welcome } from "./connection";
 import { DebuggerSessions } from "./debugger";
@@ -352,6 +353,20 @@ export class BrowserControl {
         await groupTab(request.params.tabId, request.params.app);
         this.#scheduleState();
         return;
+      case "cursor": {
+        const tab = await this.#requireExposedTab(request.params.tabId);
+        await browser.tabs.sendMessage(
+          tab.id!,
+          {
+            type: CURSOR_MESSAGE,
+            x: request.params.x,
+            y: request.params.y,
+            visible: request.params.visible,
+          },
+          { frameId: 0 },
+        );
+        return;
+      }
     }
     throw new Error(
       `Unknown request: ${(request as { method: string }).method}`,
