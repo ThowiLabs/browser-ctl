@@ -64,6 +64,11 @@ type Session struct {
 	// LastAX is the last snapshot's nodes in document order (ref, role,
 	// accessible name), for locator resolution against the AX tree.
 	LastAX []AXEntry
+	// CursorX/CursorY is where the simulated cursor overlay was last
+	// left, so the next move can glide from there like a human hand;
+	// CursorKnown is false until the first move.
+	CursorX, CursorY float64
+	CursorKnown      bool
 }
 
 // AddCapabilities enables capabilities (e.g. "cdp") on the session.

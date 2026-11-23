@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +37,9 @@ func doClick(ctx *Context) (string, string, error) {
 		clickCount = 2
 	}
 	before := currentURL(ctx.Engine, client)
-	moveCursor(client, box.CX, box.CY)
+	moveCursor(ctx.Session, client, box.CX, box.CY, true)
+	// Brief pause on arrival, like a human hand settling before the press.
+	time.Sleep(80 * time.Millisecond)
 	if err := mouseClick(client, box.CX, box.CY, button, clickCount); err != nil {
 		return "", "", err
 	}
@@ -53,11 +56,8 @@ func doHover(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	moveCursor(client, box.CX, box.CY)
-	_, err = client.Call("Input.dispatchMouseEvent", map[string]any{
-		"type": "mouseMoved", "x": box.CX, "y": box.CY, "button": "none",
-	})
-	return "", "", err
+	moveCursor(ctx.Session, client, box.CX, box.CY, true)
+	return "", "", nil
 }
 
 func doDrag(ctx *Context) (string, string, error) {
@@ -76,6 +76,7 @@ func doDrag(ctx *Context) (string, string, error) {
 	// The moves must carry buttons:1 (left held): without it Chrome
 	// sees the mouse moving with no button pressed and never starts
 	// the HTML5 drag, so the drop has no effect.
+	moveCursor(ctx.Session, client, from.CX, from.CY, true)
 	if _, err := client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mousePressed", "x": from.CX, "y": from.CY, "button": "left", "buttons": 1, "clickCount": 1}); err != nil {
 		return "", "", err
 	}
@@ -88,6 +89,8 @@ func doDrag(ctx *Context) (string, string, error) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// Glide the overlay to the drop point before releasing, like JS.
+	moveCursor(ctx.Session, client, to.CX, to.CY, false)
 	_, err = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseReleased", "x": to.CX, "y": to.CY, "button": "left", "buttons": 0, "clickCount": 1})
 	return "", "", err
 }
@@ -501,10 +504,96 @@ func settleAfterAction(client *cdp.Client, before string) {
 	}
 }
 
-// moveCursor draws the on-page cursor overlay (blue arrow + label), like
-// JS moveCursor, gliding to the point.
-func moveCursor(client *cdp.Client, x, y float64) {
-	js := fmt.Sprintf(`(function(){var el=document.getElementById('browser-ctl-cursor'); if(!el){ el=document.createElement('div'); el.id='browser-ctl-cursor'; el.setAttribute('aria-hidden','true'); el.style.cssText='position:fixed;z-index:2147483647;pointer-events:none;transition:left .3s,top .3s;font:12px sans-serif;color:#1a73e8;'; el.innerHTML='➤ browser-ctl'; document.documentElement.appendChild(el);} el.style.left=%v+'px'; el.style.top=%v+'px'; })()`, x, y)
+// moveCursor glides the on-page cursor overlay to the point the way a
+// human hand would: a gently curved path (quadratic bezier, pushed a
+// little to one side) with ease-in-out timing — slow start, fast middle,
+// slow landing — instead of a straight-line teleport. The real mouse
+// follows the same path with mouseMoved events when emit is true, so
+// hover effects trigger along the way; drag passes false for the final
+// glide because the real mouse already travelled there in steps.
+// The overlay is the JS original's: a big blue SVG arrow with glow and
+// a pill label, living in a closed shadow root so it never leaks into
+// innerText or snapshots. The last position is kept on the session, so
+// the next move starts where the hand was left.
+func moveCursor(sess *Session, client *cdp.Client, x, y float64, emit bool) {
+	sess.mu.Lock()
+	sx, sy, known := sess.CursorX, sess.CursorY, sess.CursorKnown
+	sess.mu.Unlock()
+	setCursorPos(client, x, y)
+	if !known {
+		// No start point yet, so no glide — but the real mouse must
+		// still be told where it is, or :hover never triggers.
+		if emit {
+			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "none"})
+		}
+		sess.mu.Lock()
+		sess.CursorX, sess.CursorY, sess.CursorKnown = x, y, true
+		sess.mu.Unlock()
+		return
+	}
+	dx, dy := x-sx, y-sy
+	dist := math.Hypot(dx, dy)
+	if dist < 2 {
+		if emit {
+			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "none"})
+		}
+		sess.mu.Lock()
+		sess.CursorX, sess.CursorY = x, y
+		sess.mu.Unlock()
+		return
+	}
+	// Control point: midpoint pushed sideways 8% of the distance.
+	mx, my := (sx+x)/2, (sy+y)/2
+	px, py := -dy/dist, dx/dist
+	off := 0.08 * dist
+	cx, cy := mx+px*off, my+py*off
+	steps := int(dist / 40)
+	if steps < 8 {
+		steps = 8
+	}
+	if steps > 24 {
+		steps = 24
+	}
+	dur := 200 + dist*0.6
+	if dur < 250 {
+		dur = 250
+	}
+	if dur > 700 {
+		dur = 700
+	}
+	pause := time.Duration(dur/float64(steps)) * time.Millisecond
+	for i := 1; i <= steps; i++ {
+		t := float64(i) / float64(steps)
+		e := easeInOutCubic(t)
+		bx := (1-e)*(1-e)*sx + 2*(1-e)*e*cx + e*e*x
+		by := (1-e)*(1-e)*sy + 2*(1-e)*e*cy + e*e*y
+		setCursorPos(client, bx, by)
+		if emit {
+			_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": bx, "y": by, "button": "none"})
+		}
+		time.Sleep(pause)
+	}
+	setCursorPos(client, x, y)
+	if emit {
+		_, _ = client.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y, "button": "none"})
+	}
+	sess.mu.Lock()
+	sess.CursorX, sess.CursorY = x, y
+	sess.mu.Unlock()
+}
+
+func easeInOutCubic(t float64) float64 {
+	if t < 0.5 {
+		return 4 * t * t * t
+	}
+	return 1 - math.Pow(-2*t+2, 3)/2
+}
+
+// setCursorPos creates the cursor overlay once and moves it to (x, y).
+// Same look as the JS original: blue SVG arrow with glow + pill label,
+// in a closed shadow root on <html>, aria-hidden and pointer-events none.
+func setCursorPos(client *cdp.Client, x, y float64) {
+	js := fmt.Sprintf(`(function(){var id='browser-ctl-cursor';var host=document.getElementById(id);if(!host){host=document.createElement('div');host.id=id;host.setAttribute('aria-hidden','true');host.style.cssText='position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;';host.attachShadow({mode:'closed'}).innerHTML='<style>.arrow{position:absolute;left:-3px;top:-3px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45)) drop-shadow(0 0 6px rgba(37,99,235,.9));}.label{position:absolute;left:22px;top:26px;padding:3px 9px;border-radius:999px;background:#2563eb;color:#fff;font:600 12px/16px system-ui,-apple-system,sans-serif;white-space:nowrap;border:1.5px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35);}</style><svg class="arrow" width="30" height="36" viewBox="0 0 20 24"><path d="M1 1 L1 19 L6 14.5 L9.5 22 L12.5 20.7 L9 13.3 L15.5 13 Z" fill="#2563eb" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg><div class="label">browser-ctl</div>';document.documentElement.appendChild(host);}host.style.transform='translate(%vpx, %vpx)';})()`, x, y)
 	_, _ = client.Call("Runtime.evaluate", map[string]any{"expression": js})
 }
 
