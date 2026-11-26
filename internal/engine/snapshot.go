@@ -89,15 +89,13 @@ func doSnapshot(ctx *Context) (string, string, error) {
 	_, interactive := ctx.Flags["i"]
 	max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
 
-	snap, refs, nodes, ax, err := ctx.Engine.axSnapshot(client, depth, interactive)
+	snap, refs, nodes, ax, _, err := ctx.Engine.axSnapshot(client, depth, interactive)
 	if err != nil {
 		return "", "", err
 	}
-	ctx.Session.mu.Lock()
-	ctx.Session.LastRefs = refs
-	ctx.Session.LastRefNodes = nodes
-	ctx.Session.LastAX = ax
-	ctx.Session.mu.Unlock()
+	// The ref space belongs to the tab this snapshot was taken on
+	// (the client's tab): refs never leak across tabs.
+	ctx.Session.setRefs(client.TabID(), refs, nodes, ax)
 	return cap(snap, max), "", nil
 }
 
@@ -105,7 +103,7 @@ func doSnapshot(ctx *Context) (string, string, error) {
 // Returns the rendered snapshot, ref->JS-expr map, ref->backend DOM node
 // id map (0 when the node has no backend id), and the nodes in document
 // order for locator resolution.
-func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (string, map[string]string, map[string]int, []AXEntry, error) {
+func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (string, map[string]string, map[string]int, []AXEntry, []int, error) {
 	// Frame tree first, so refs in iframes get the f<index> prefix.
 	// The child list is "childFrames" (nested); flatten it in document
 	// order: main frame first (index 0), then each child frame.
@@ -144,6 +142,7 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 	nodes := map[string]int{}
 	var ax []AXEntry
 	var lines []string
+	var lineFrames []int
 	for attempt := 0; ; attempt++ {
 		// One AX tree per frame: getFullAXTree without a frameId only
 		// covers the main frame, so iframe contents need their own
@@ -162,7 +161,7 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 			raw, err := client.Call("Accessibility.getFullAXTree", params)
 			if err != nil {
 				if i == 0 {
-					return "", nil, nil, nil, err
+					return "", nil, nil, nil, nil, err
 				}
 				continue
 			}
@@ -171,7 +170,7 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 			}
 			if err := json.Unmarshal(raw, &res); err != nil {
 				if i == 0 {
-					return "", nil, nil, nil, err
+					return "", nil, nil, nil, nil, err
 				}
 				continue
 			}
@@ -195,13 +194,14 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 			frames = append(frames, axFrame{byID: byID, roots: roots})
 		}
 		if len(frames) == 0 {
-			return "", nil, nil, nil, fmt.Errorf("snapshot: no AX tree")
+			return "", nil, nil, nil, nil, fmt.Errorf("snapshot: no AX tree")
 		}
 		refs = map[string]string{}
 		nodes = map[string]int{}
 		ax = nil
 		next := 1
 		lines = nil
+		lineFrames = nil
 		iframeSeen := 0
 		var walk func(n *axNode, level int, byID map[string]*axNode, frameIdx int, nearestBackend int)
 		walk = func(n *axNode, level int, byID map[string]*axNode, frameIdx int, nearestBackend int) {
@@ -271,6 +271,7 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 					line += ": " + c
 				}
 				lines = append(lines, line)
+				lineFrames = append(lineFrames, frameIdx)
 			}
 			// An iframe's content lives in its own AX tree: walk it
 			// nested under the iframe element (Nth iframe in the main
@@ -299,14 +300,14 @@ func (e *Engine) axSnapshot(client *cdp.Client, depth int, interactive bool) (st
 		time.Sleep(500 * time.Millisecond)
 	}
 	if len(lines) == 0 {
-		return "(empty page)", refs, nodes, ax, nil
+		return "(empty page)", refs, nodes, ax, lineFrames, nil
 	}
-	return strings.Join(lines, "\n"), refs, nodes, ax, nil
+	return strings.Join(lines, "\n"), refs, nodes, ax, lineFrames, nil
 }
 
 // axNodeExpr returns a JS expression for an AX node, falling back to a
 // role+name query. Precise resolution uses the backend DOM node id
-// (LastRefNodes) via DOM.resolveNode instead. The query covers both the
+// (the ref table's node ids) via DOM.resolveNode instead. The query covers both the
 // explicit role attribute and the implicit tag for the role: a plain
 // [role="link"] misses <a> elements, which have no role attribute.
 func axNodeExpr(n *axNode) string {
@@ -334,18 +335,89 @@ func doFind(ctx *Context) (string, string, error) {
 		text = ctx.Args[0]
 	}
 	max := readCap(ctx.Flags["max"], func() bool { _, ok := ctx.Flags["max"]; return ok }())
-	snap, _, _, _, err := ctx.Engine.axSnapshot(client, 0, false)
-	if err != nil {
-		return "", "", err
-	}
 	var matches []string
-	for _, line := range strings.Split(snap, "\n") {
-		if strings.Contains(strings.ToLower(line), strings.ToLower(text)) {
+	// Source 1: the accessibility snapshot (node names and values).
+	// The AX tree is fetched per frame, so it also reaches frames the
+	// page itself cannot read; rendered lines know their frame and
+	// iframe matches are tagged with it.
+	snap, _, _, _, lineFrames, axErr := ctx.Engine.axSnapshot(client, 0, false)
+	if axErr == nil {
+		for i, line := range strings.Split(snap, "\n") {
+			if !strings.Contains(strings.ToLower(line), strings.ToLower(text)) {
+				continue
+			}
+			if i < len(lineFrames) && lineFrames[i] > 0 {
+				line = fmt.Sprintf("[frame %d] %s", lineFrames[i], line)
+			}
 			matches = append(matches, line)
 		}
 	}
+	// Source 2: the rendered text itself — main document, same-origin
+	// iframes and open shadow roots. AX names fragment long text
+	// across inline nodes, so body text that only exists whole in the
+	// DOM (an email's verification code, say) is only found here.
+	for _, m := range ctx.Engine.deepTextFind(client, text) {
+		matches = append(matches, fmt.Sprintf("[%s] %s", m.Where, m.Snippet))
+	}
 	if len(matches) == 0 {
+		if axErr != nil {
+			return "", "", axErr
+		}
 		return "no matches for " + text, "", nil
 	}
 	return cap(strings.Join(matches, "\n"), max), "", nil
+}
+
+// textMatch is one deepTextFind hit: where it was found (main frame,
+// an iframe, a shadow root) and a snippet around the match.
+type textMatch struct {
+	Where   string `json:"where"`
+	Snippet string `json:"snippet"`
+}
+
+// deepTextFind searches the page's rendered text for text (case
+// insensitive) beyond the main document: every same-origin iframe,
+// recursively, and every open shadow root. Cross-origin frames are
+// skipped — the browser forbids reading them from the page — but
+// doFind's AX source still covers them; closed shadow roots are
+// unreachable by design and likewise left to the AX source.
+func (e *Engine) deepTextFind(client *cdp.Client, text string) []textMatch {
+	if text == "" {
+		return nil
+	}
+	js := fmt.Sprintf(`(function(){
+var needle=%s;
+var out=[];
+function snip(t,i){var s=Math.max(0,i-40);var en=Math.min(t.length,i+needle.length+40);return (s>0?"\u2026":"")+t.slice(s,en).replace(/\s+/g," ").trim()+(en<t.length?"\u2026":"");}
+function search(t,where){var low=t.toLowerCase();var i=0;while(out.length<20&&(i=low.indexOf(needle,i))>=0){out.push({where:where,snippet:snip(t,i)});i+=needle.length;}}
+function walkKids(root,where){var kids=root.childNodes||[];for(var i=0;i<kids.length;i++){walkNode(kids[i],where);}}
+function walkNode(n,where){
+if(out.length>=20)return;
+if(n.nodeType===3){search(n.nodeValue||"",where);return;}
+if(n.nodeType!==1&&n.nodeType!==11)return;
+if(n.shadowRoot){walkKids(n.shadowRoot,where+" > shadow root");}
+walkKids(n,where);
+}
+function walkDoc(doc,where){
+if(!doc)return;
+walkKids(doc,where);
+var frames=doc.querySelectorAll?doc.querySelectorAll("iframe"):[];
+for(var i=0;i<frames.length;i++){
+var f=frames[i];var sub=null;
+try{sub=f.contentDocument;}catch(err){sub=null;}
+if(sub){walkDoc(sub,"frame "+(i+1)+(f.getAttribute("src")?": "+f.getAttribute("src"):""));}
+}
+}
+walkDoc(document,"main frame");
+return out;
+})()`, jsonString(strings.ToLower(text)))
+	raw, err := e.eval(client, js)
+	if err != nil {
+		return nil
+	}
+	var out []textMatch
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
 }

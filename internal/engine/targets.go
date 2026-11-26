@@ -381,21 +381,19 @@ func ResolveTargetSess(e *Engine, client *cdp.Client, sess *Session, target stri
 		if sess == nil {
 			return "", fmt.Errorf("ref targets need a snapshot first (run `snapshot`)")
 		}
-		sess.mu.Lock()
-		expr, ok := sess.LastRefs[target]
-		sess.mu.Unlock()
-		if !ok {
-			return "", fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", target)
+		if tbl := sess.currentRefs(); tbl != nil {
+			if expr, ok := tbl.Refs[target]; ok {
+				return expr, nil
+			}
 		}
-		return expr, nil
+		return "", fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", target)
 	}
 	if sess != nil {
 		if ref, ok := locatorAXRef(sess, target); ok {
-			sess.mu.Lock()
-			expr, ok2 := sess.LastRefs[ref]
-			sess.mu.Unlock()
-			if ok2 {
-				return expr, nil
+			if tbl := sess.currentRefs(); tbl != nil {
+				if expr, ok2 := tbl.Refs[ref]; ok2 {
+					return expr, nil
+				}
 			}
 		}
 	}
@@ -428,12 +426,14 @@ func resolveLocatorAX(sess *Session, calls []LocatorCall) (string, bool) {
 // resolveLocatorAXMatches devuelve todos los nodos del snapshot que
 // casan con el locator (nil si el método no se resuelve por AX).
 func resolveLocatorAXMatches(sess *Session, calls []LocatorCall) []AXEntry {
-	if sess == nil || len(calls) == 0 || len(sess.LastAX) == 0 {
+	if sess == nil || len(calls) == 0 {
 		return nil
 	}
-	sess.mu.Lock()
-	ax := append([]AXEntry(nil), sess.LastAX...)
-	sess.mu.Unlock()
+	tbl := sess.currentRefs()
+	if tbl == nil || len(tbl.AX) == 0 {
+		return nil
+	}
+	ax := append([]AXEntry(nil), tbl.AX...)
 	var matches []AXEntry
 	switch calls[0].Method {
 	case "getByRole":
@@ -630,9 +630,11 @@ func jsonString(s string) string {
 // (counting all matches of the base query).
 func countForTarget(e *Engine, client *cdp.Client, sess *Session, target string) (int, error) {
 	if refRe.MatchString(target) {
-		sess.mu.Lock()
-		expr, ok := sess.LastRefs[target]
-		sess.mu.Unlock()
+		var expr string
+		var ok bool
+		if tbl := sess.currentRefs(); tbl != nil {
+			expr, ok = tbl.Refs[target]
+		}
 		if !ok {
 			return 0, fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", target)
 		}

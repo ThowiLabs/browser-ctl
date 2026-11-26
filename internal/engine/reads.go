@@ -23,10 +23,12 @@ func callOnRef(client *cdp.Client, sess *Session, target, fn string) (json.RawMe
 	if sess == nil || !refRe.MatchString(target) {
 		return nil, false, nil
 	}
-	sess.mu.Lock()
-	backendID, hasNode := sess.LastRefNodes[target]
-	_, ok := sess.LastRefs[target]
-	sess.mu.Unlock()
+	var backendID int
+	var hasNode, ok bool
+	if tbl := sess.currentRefs(); tbl != nil {
+		backendID, hasNode = tbl.Nodes[target]
+		_, ok = tbl.Refs[target]
+	}
 	if !ok {
 		return nil, false, fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", target)
 	}
@@ -212,6 +214,18 @@ func doEval(ctx *Context) (string, string, error) {
 		target = tExpr
 	}
 	raw, err := ctx.Engine.eval(client, wrapEvalExpr(ctx.Args[0], target))
+	if err != nil && isSyntaxError(err) {
+		// The wrapped form only accepts a single expression, so a
+		// multi-statement program (a; b) is a SyntaxError there. A
+		// syntax error means nothing ran, so it is safe to retry
+		// the code as a program: Runtime.evaluate returns the
+		// program's completion value (the last expression's value).
+		if raw2, err2 := ctx.Engine.eval(client, strings.TrimSpace(ctx.Args[0])); err2 == nil {
+			raw, err = raw2, nil
+		} else {
+			err = err2
+		}
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -226,6 +240,12 @@ func wrapEvalExpr(expr, target string) string {
 	expr = strings.TrimSpace(expr)
 	expr = strings.TrimRight(expr, ";")
 	return fmt.Sprintf("(function(){var f=(%s); if(typeof f==='function'){return f(%s);} return f;})()", expr, target)
+}
+
+// isSyntaxError reports whether an eval failure is a JS SyntaxError
+// (the exception description's first line carries the class name).
+func isSyntaxError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "SyntaxError")
 }
 
 // formatEvalValue imprime un valor CDP: strings sin comillas JSON, el

@@ -113,9 +113,11 @@ func nodeIDForTarget(e *Engine, client *cdp.Client, sess *Session, target string
 		target = ref
 	}
 	if refRe.MatchString(target) {
-		sess.mu.Lock()
-		backendID, ok := sess.LastRefNodes[target]
-		sess.mu.Unlock()
+		var backendID int
+		var ok bool
+		if tbl := sess.currentRefs(); tbl != nil {
+			backendID, ok = tbl.Nodes[target]
+		}
 		if !ok || backendID == 0 {
 			return 0, fmt.Errorf("ref %s has no DOM node id. Run `snapshot` again", target)
 		}

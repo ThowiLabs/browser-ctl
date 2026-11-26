@@ -70,14 +70,14 @@ func TestMergeTargetArgs(t *testing.T) {
 }
 
 func TestResolveLocatorAX(t *testing.T) {
-	sess := &Session{LastAX: []AXEntry{
+	sess := &Session{Current: 101, RefTabs: map[int]*RefTable{101: {AX: []AXEntry{
 		{Ref: "e1", Role: "link", Name: "Learn more"},
 		{Ref: "e2", Role: "button", Name: "Enviar"},
 		{Ref: "e3", Role: "button", Name: "Enviar formulario"},
 		{Ref: "e4", Role: "textbox", Name: "Email"},
 		{Ref: "e5", Role: "searchbox", Name: "Buscar"},
 		{Ref: "e6", Role: "button", Name: "Cancelar"},
-	}}
+	}}}}
 	cases := []struct {
 		target string
 		want   string

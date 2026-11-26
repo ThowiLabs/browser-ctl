@@ -147,14 +147,42 @@ func doFill(ctx *Context) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	expr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, ctx.Args[0])
-	if err != nil {
+	text := ctx.Args[1]
+	// Precise path first — the same one get and click use: resolve
+	// the target's backend DOM node and set the value on the element
+	// itself (Runtime.callFunctionOn). The stored snapshot expression
+	// re-queries the DOM by role and accessible name, and an input
+	// whose name comes from a <label> element or aria-labelledby has
+	// neither innerText nor an aria-label attribute to match on, so
+	// the re-query returns null and fill died with "no element" (the
+	// 2FA verification-code input) while click on the same ref
+	// worked. Locators resolve through the AX snapshot to their ref
+	// first, like nodeIDForTarget does for upload.
+	target := ctx.Args[0]
+	if ref, ok := locatorAXRef(ctx.Session, target); ok {
+		target = ref
+	}
+	fillFn := fmt.Sprintf("function(){ this.focus(); this.value=%s; this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); return true; }", jsonString(text))
+	filled := false
+	if v, handled, err := callOnRef(client, ctx.Session, target, fillFn); handled {
+		if err != nil {
+			return "", "", err
+		}
+		var ok bool
+		_ = json.Unmarshal(v, &ok)
+		filled = ok
+	} else if err != nil {
 		return "", "", err
 	}
-	text := ctx.Args[1]
-	setExpr := fmt.Sprintf("(function(){var el=%s; if(!el) throw new Error('no element'); el.focus(); el.value=%s; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true;})()", expr, jsonString(text))
-	if _, err := ctx.Engine.eval(client, setExpr); err != nil {
-		return "", "", err
+	if !filled {
+		expr, err := ResolveTargetSess(ctx.Engine, client, ctx.Session, ctx.Args[0])
+		if err != nil {
+			return "", "", err
+		}
+		setExpr := fmt.Sprintf("(function(){var el=%s; if(!el) throw new Error('no element'); el.focus(); el.value=%s; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true;})()", expr, jsonString(text))
+		if _, err := ctx.Engine.eval(client, setExpr); err != nil {
+			return "", "", err
+		}
 	}
 	if _, ok := ctx.Flags["submit"]; ok {
 		return doPress(&Context{Engine: ctx.Engine, Session: ctx.Session, Args: []string{"Enter"}, Flags: map[string]string{}})
@@ -326,10 +354,15 @@ func resolveRefBox(e *Engine, client *cdp.Client, sess *Session, ref string) (bo
 	if sess == nil {
 		return box{}, fmt.Errorf("snapshot refs need a session (run `snapshot` first)")
 	}
-	sess.mu.Lock()
-	backendID, hasNode := sess.LastRefNodes[ref]
-	expr, ok := sess.LastRefs[ref]
-	sess.mu.Unlock()
+	tbl := sess.currentRefs()
+	var backendID int
+	var hasNode bool
+	var expr string
+	var ok bool
+	if tbl != nil {
+		backendID, hasNode = tbl.Nodes[ref]
+		expr, ok = tbl.Refs[ref]
+	}
 	if !ok {
 		return box{}, fmt.Errorf("ref %s isn't on the page anymore. Run `snapshot -i` and use a fresh ref", ref)
 	}
@@ -410,9 +443,11 @@ func checkActionable(e *Engine, client *cdp.Client, sess *Session, target string
 	}
 	// Precise path for snapshot refs: backend DOM node id.
 	if refRe.MatchString(target) && sess != nil {
-		sess.mu.Lock()
-		backendID, ok := sess.LastRefNodes[target]
-		sess.mu.Unlock()
+		var backendID int
+		var ok bool
+		if tbl := sess.currentRefs(); tbl != nil {
+			backendID, ok = tbl.Nodes[target]
+		}
 		if ok && backendID != 0 {
 			return hitTestNode(client, backendID, b)
 		}

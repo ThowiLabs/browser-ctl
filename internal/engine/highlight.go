@@ -59,9 +59,11 @@ func refBackendNode(sess *Session, target string) (int, bool) {
 			return 0, false
 		}
 	}
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	id, ok := sess.LastRefNodes[ref]
+	tbl := sess.currentRefs()
+	if tbl == nil {
+		return 0, false
+	}
+	id, ok := tbl.Nodes[ref]
 	if !ok || id == 0 {
 		return 0, false
 	}
