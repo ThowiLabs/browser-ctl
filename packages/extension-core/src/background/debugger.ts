@@ -213,9 +213,9 @@ export class DebuggerSessions {
   }
 
   /**
-   * Detaches from the tabs this extension is still attached to from before the service worker restarted, so Chrome's debugging bar doesn't stay. The daemon attaches again when an agent uses them
+   * Detaches from the tabs this extension is still attached to from before the service worker restarted, so Chrome's debugging bar doesn't stay. The daemon attaches again when an agent uses them. Tabs in `keep` are spared: the controlled-tab registry says they're still this extension's, Chrome kept their attachments across the restart, and the next handshake re-registers them instead
    */
-  async detachStale(): Promise<void> {
+  async detachStale(keep: ReadonlySet<number> = new Set()): Promise<void> {
     const targets = await browser.debugger.getTargets();
     await Promise.all(
       targets
@@ -223,7 +223,8 @@ export class DebuggerSessions {
           (target) =>
             target.attached &&
             target.tabId !== undefined &&
-            !this.#attached.has(target.tabId),
+            !this.#attached.has(target.tabId) &&
+            !keep.has(target.tabId),
         )
         // Fails for tabs another extension or DevTools is debugging, which is fine
         .map((target) =>

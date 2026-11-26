@@ -3,7 +3,7 @@ import { storage } from "wxt/utils/storage";
 import type { ConnectionStatus, TabGroupColor } from "./types";
 
 /*
- * Browser control's state lives in `storage.session`: it survives the service worker stopping (which Chrome does whenever it's idle), but not a browser restart. Debugger attachments are never stored: they're in memory, and the daemon attaches again after a restart. What the user chose (paired keys, the port, the browser's name) and the browser's ID are in `storage.local`
+ * Browser control's state lives in `storage.session`: it survives the service worker stopping (which Chrome does whenever it's idle), but not a browser restart. That includes the controlled-tab registry — which tabs the debugger is on — so the extension itself re-attaches them when a daemon pairs again or the service worker restarts: the attachments are Chrome state, never serialized, only re-created. What the user chose (paired keys, the port, the browser's name) and the browser's ID are in `storage.local`
  */
 
 /** The connection to the daemon, for the popup. Reset when the service worker starts, so it never shows a connection that's gone */
@@ -78,6 +78,22 @@ export const lastFocusedAtItem = storage.defineItem<number | null>(
   "session:browserControlLastFocusedAt",
   { fallback: null },
 );
+
+/** One tab the extension controls, remembered so control survives the relay or daemon dying and the service worker restarting */
+export type ControlledTab = {
+  /** The tab's last known URL */
+  url: string;
+  /** `attached`: the debugger is on. `recoverable`: it came off for a reason that doesn't end control (the daemon or relay restarted, DevTools closed) and the next daemon handshake re-attaches it. Closed and user-canceled tabs leave the registry entirely */
+  status: "attached" | "recoverable";
+  /** The `chrome.debugger` detach reason, when `recoverable` */
+  reason?: string;
+  updatedAt: number;
+};
+
+/** The tabs this extension controls, by tab ID. In `storage.session`, like the rest of browser control's state: it survives the service worker stopping, not a browser restart (after which the tab IDs may be other pages) */
+export const controlledTabsItem = storage.defineItem<
+  Record<string, ControlledTab>
+>("session:browserControlControlledTabs", { fallback: {} });
 
 /** Development and test builds only: the port to look for a 0.1.x server on instead of `LEGACY_PORT`, so the smoke test can run a fake one on a random port without touching 9009 */
 export const legacyPortItem = storage.defineItem<number | null>(

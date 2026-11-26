@@ -21,6 +21,7 @@ import {
   browserIdItem,
   browserLabelItem,
   connectionStatusItem,
+  controlledTabsItem,
   lastActiveAppItem,
   lastFocusedAtItem,
   legacyPortItem,
@@ -28,6 +29,7 @@ import {
   pausedItem,
   relayPortItem,
 } from "../storage";
+import type { ControlledTab } from "../storage";
 import type {
   BrowserControlApp,
   BrowserControlView,
@@ -169,7 +171,7 @@ export class BrowserControl {
       setLegacyServer: (present) => this.#setLegacyServer(present),
       onDisconnect: () => {
         this.#daemon = null;
-        void this.debugger.detachAll();
+        // The relay going away (the daemon exited or restarted) does NOT end control: the debugger attachments stay on, and the controlled-tab registry lets the next daemon's handshake pick the tabs up again. Only the user's **Stop** detaches
         void this.#updateBadge();
       },
     });
@@ -239,10 +241,14 @@ export class BrowserControl {
     if (status.state === "connected") {
       await connectionStatusItem.setValue({ state: "searching" });
     }
+    // Tabs the registry still calls ours keep their attachments across this restart; everything else still attached is stale
+    const controlled = await controlledTabsItem.getValue();
     await Promise.all([
-      this.debugger.detachStale().catch((error: unknown) => {
-        console.warn("Couldn't detach from tabs", error);
-      }),
+      this.debugger
+        .detachStale(new Set(Object.keys(controlled).map(Number)))
+        .catch((error: unknown) => {
+          console.warn("Couldn't detach from tabs", error);
+        }),
       reconcileAppGroups().catch((error: unknown) => {
         console.warn("Couldn't restore the agents' tab groups", error);
       }),
@@ -292,7 +298,85 @@ export class BrowserControl {
       paired: true,
     });
     await this.#updateBadge();
+    // A new daemon inherits the tabs the registry says are ours: re-attach the ones that lost their debugger while no daemon was connected
+    await this.#reattachControlledTabs();
     await this.#sendState();
+  }
+
+  /** Records a tab in the controlled-tab registry, or forgets it (`entry` null) */
+  async #setControlledTab(
+    tabId: number,
+    entry: ControlledTab | null,
+  ): Promise<void> {
+    const registry = { ...(await controlledTabsItem.getValue()) };
+    if (entry === null) {
+      if (!(String(tabId) in registry)) {
+        return;
+      }
+      delete registry[String(tabId)];
+    } else {
+      registry[String(tabId)] = entry;
+    }
+    await controlledTabsItem.setValue(registry);
+  }
+
+  /**
+   * Re-attaches the registered tabs that still exist but lost their debugger — the relay or daemon died, the service worker restarted, DevTools was closed — so control survives process death on either side. Tabs that are gone or no longer exposed leave the registry; one whose attach Chrome refuses stays `recoverable` for the next handshake (and the daemon's engine re-attaches lazily on the first command that finds it detached). `getState()` reports the real attachment either way, never the registry's word for it
+   */
+  async #reattachControlledTabs(): Promise<void> {
+    if (await pausedItem.getValue()) {
+      return;
+    }
+    const registry = { ...(await controlledTabsItem.getValue()) };
+    let changed = false;
+    for (const [key, entry] of Object.entries(registry)) {
+      const tabId = Number(key);
+      const tab = await browser.tabs.get(tabId).catch(() => null);
+      if (!tab) {
+        delete registry[key];
+        changed = true;
+        continue;
+      }
+      if (this.debugger.isAttached(tabId)) {
+        if (entry.status !== "attached") {
+          registry[key] = {
+            url: tab.url ?? entry.url,
+            status: "attached",
+            updatedAt: Date.now(),
+          };
+          changed = true;
+        }
+        continue;
+      }
+      try {
+        await this.#requireExposedTab(tabId);
+      } catch {
+        // It navigated somewhere agents can't go: not ours anymore
+        delete registry[key];
+        changed = true;
+        continue;
+      }
+      try {
+        // Same checks as a fresh `attach`: Stop or a navigation may have come meanwhile
+        await this.debugger.attach(tabId, async () => {
+          if (await pausedItem.getValue()) {
+            throw new Error(PAUSED_MESSAGE);
+          }
+          await this.#requireExposedTab(tabId);
+        });
+        registry[key] = {
+          url: tab.url ?? entry.url,
+          status: "attached",
+          updatedAt: Date.now(),
+        };
+      } catch {
+        registry[key] = { ...entry, status: "recoverable", updatedAt: Date.now() };
+      }
+      changed = true;
+    }
+    if (changed) {
+      await controlledTabsItem.setValue(registry);
+    }
   }
 
   async #handleRequest(request: ExtensionRequest): Promise<unknown> {
@@ -301,8 +385,13 @@ export class BrowserControl {
       throw new Error(pairingRequiredMessage(daemon?.code ?? undefined));
     }
     switch (request.method) {
-      case "detach":
-        return this.debugger.detach(request.params.tabId);
+      case "detach": {
+        const { tabId } = request.params;
+        await this.debugger.detach(tabId);
+        // The daemon released the tab on purpose: it leaves the registry, so no later handshake re-attaches it
+        await this.#setControlledTab(tabId, null);
+        return;
+      }
       case "activity":
         await lastActiveAppItem.setValue(request.params.appId);
         await this.#updateBadge();
@@ -316,14 +405,20 @@ export class BrowserControl {
     switch (request.method) {
       case "attach": {
         const { tabId } = request.params;
-        await this.#requireExposedTab(tabId);
+        const tab = await this.#requireExposedTab(tabId);
         // Again once attached: Stop or a navigation may have come meanwhile
-        return this.debugger.attach(tabId, async () => {
+        const result = await this.debugger.attach(tabId, async () => {
           if (await pausedItem.getValue()) {
             throw new Error(PAUSED_MESSAGE);
           }
           await this.#requireExposedTab(tabId);
         });
+        await this.#setControlledTab(tabId, {
+          url: tab.url ?? "",
+          status: "attached",
+          updatedAt: Date.now(),
+        });
+        return result;
       }
       case "cdp": {
         const { method, params } = request.params;
@@ -479,8 +574,27 @@ export class BrowserControl {
     this.#emit({ type: "detached", data: { tabId, reason } });
     // Cancel on Chrome's debugging bar: the user wants every agent to stop
     if (reason === "canceled_by_user") {
+      await this.#setControlledTab(tabId, null);
       await this.stop();
+      return;
     }
+    // The tab itself is gone: nothing to recover
+    if (reason === "target_closed") {
+      await this.#setControlledTab(tabId, null);
+      return;
+    }
+    // Anything else — DevTools was closed, the target was replaced — leaves the tab alive: mark it recoverable, and the next daemon handshake re-attaches it
+    const tab = await browser.tabs.get(tabId).catch(() => null);
+    if (!tab) {
+      await this.#setControlledTab(tabId, null);
+      return;
+    }
+    await this.#setControlledTab(tabId, {
+      url: tab.url ?? "",
+      status: "recoverable",
+      reason,
+      updatedAt: Date.now(),
+    });
   }
 
   async #onTabUpdated(
@@ -491,6 +605,17 @@ export class BrowserControl {
       const assignment = await updateTabAssignment(tabId);
       if (assignment) {
         this.#emit({ type: "tabAssigned", data: assignment });
+      }
+    }
+    if (changeInfo.url !== undefined) {
+      // Keep the registry's last known URL for the tab honest
+      const entry = (await controlledTabsItem.getValue())[String(tabId)];
+      if (entry && entry.url !== changeInfo.url) {
+        await this.#setControlledTab(tabId, {
+          ...entry,
+          url: changeInfo.url,
+          updatedAt: Date.now(),
+        });
       }
     }
     if (changeInfo.url !== undefined || changeInfo.discarded) {
@@ -528,6 +653,7 @@ export class BrowserControl {
 
   async #onTabRemoved(tabId: number): Promise<void> {
     await forgetTab(tabId);
+    await this.#setControlledTab(tabId, null);
     this.#scheduleState();
   }
 
@@ -694,6 +820,8 @@ export class BrowserControl {
     await pausedItem.setValue(true);
     const tabIds = [...this.debugger.attachedTabIds];
     await this.debugger.detachAll();
+    // **Stop** ends control: no tab stays recoverable for a later handshake
+    await controlledTabsItem.setValue({});
     for (const tabId of tabIds) {
       this.#emit({ type: "detached", data: { tabId, reason: "paused" } });
     }
@@ -719,6 +847,8 @@ export class BrowserControl {
     }
     this.#report("daemon paired");
     await this.#updateBadge();
+    // Pairing just granted control: pick the registry's tabs up again, like a welcome does
+    await this.#reattachControlledTabs();
     await this.#sendState();
   }
 
