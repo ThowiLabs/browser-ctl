@@ -3,9 +3,12 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +21,16 @@ import (
 type fakeExtension struct {
 	ws   *websocket.Conn
 	tabs []map[string]any
+
+	// Detach simulation: while a tab is in detached, its cdp requests
+	// fail with the real extension's error until a fresh attach clears
+	// the mark — unless the tab is also in cdpStuck, where attach
+	// succeeds but cdp keeps failing (a debugger that won't stay on).
+	mu          sync.Mutex
+	detached    map[int]bool
+	cdpStuck    map[int]bool
+	attachCount map[int]int
+	pages       map[int]*fakePage
 }
 
 func newFakeExtension(t *testing.T, port int) *fakeExtension {
@@ -43,7 +56,7 @@ func newFakeExtensionWith(t *testing.T, port int, browserID string, tabs []map[s
 	if err != nil {
 		t.Fatalf("dial extension: %v", err)
 	}
-	f := &fakeExtension{ws: ws, tabs: tabs}
+	f := &fakeExtension{ws: ws, tabs: tabs, detached: map[int]bool{}, cdpStuck: map[int]bool{}, attachCount: map[int]int{}, pages: map[int]*fakePage{}}
 	hello := map[string]any{
 		"type": "hello", "protocol": 1, "extensionVersion": "2.0.0-test",
 		"browser":   map[string]any{"name": "Chrome", "version": "140", "userAgent": "fake"},
@@ -92,6 +105,10 @@ func (f *fakeExtension) serve() {
 			Params json.RawMessage `json:"params"`
 		}
 		_ = json.Unmarshal(data, &req)
+		if errText := f.requestError(req.Method, req.Params); errText != "" {
+			_ = f.ws.WriteJSON(map[string]any{"type": "response", "id": req.ID, "error": errText})
+			continue
+		}
 		result := f.answer(req.Method, req.Params)
 		_ = f.ws.WriteJSON(map[string]any{"type": "response", "id": req.ID, "result": result})
 	}
@@ -110,13 +127,29 @@ func (f *fakeExtension) answer(method string, params json.RawMessage) any {
 		_ = f.ws.WriteJSON(map[string]any{"type": "event", "event": map[string]any{"type": "state", "data": map[string]any{"tabs": f.tabs, "paused": false, "pairing": "paired"}}})
 		return map[string]any{"tabId": 102}
 	case "attach":
+		var p struct {
+			TabID int `json:"tabId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		f.mu.Lock()
+		f.attachCount[p.TabID]++
+		if !f.cdpStuck[p.TabID] {
+			delete(f.detached, p.TabID)
+		}
+		f.mu.Unlock()
 		return map[string]any{"targetInfo": map[string]any{"targetId": "fake-target", "type": "page", "url": "https://example.com/", "title": "Example"}}
 	case "cdp":
 		var p struct {
+			TabID  int             `json:"tabId"`
 			Method string          `json:"method"`
 			Params json.RawMessage `json:"params"`
 		}
 		_ = json.Unmarshal(params, &p)
+		if pg := f.pageFor(p.TabID); pg != nil {
+			if res, ok := pg.answer(p.Method, p.Params); ok {
+				return res
+			}
+		}
 		switch p.Method {
 		case "Page.navigate":
 			return map[string]any{}
@@ -134,6 +167,49 @@ func (f *fakeExtension) answer(method string, params json.RawMessage) any {
 		return map[string]any{}
 	}
 	return map[string]any{}
+}
+
+// requestError is the detach simulation: while a tab is marked
+// detached, its cdp requests fail with the real extension's exact
+// error text. Any other request is answered normally.
+func (f *fakeExtension) requestError(method string, params json.RawMessage) string {
+	if method != "cdp" {
+		return ""
+	}
+	var p struct {
+		TabID int `json:"tabId"`
+	}
+	_ = json.Unmarshal(params, &p)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.detached[p.TabID] {
+		return fmt.Sprintf("The debugger isn't attached to tab %d", p.TabID)
+	}
+	return ""
+}
+
+// dropDebugger simulates Chrome dropping the debugger from a tab the
+// daemon still believes it has claimed (daemon/extension restart).
+func (f *fakeExtension) dropDebugger(tabID int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detached[tabID] = true
+}
+
+// stickDebugger is dropDebugger plus: re-attaching reports success
+// but cdp keeps failing — a debugger that won't stay on.
+func (f *fakeExtension) stickDebugger(tabID int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detached[tabID] = true
+	f.cdpStuck[tabID] = true
+}
+
+// attaches counts the attach requests a tab has received.
+func (f *fakeExtension) attaches(tabID int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attachCount[tabID]
 }
 
 func TestDaemonWithFakeExtension(t *testing.T) {
@@ -303,4 +379,242 @@ func TestPublicTabIDsAcrossBrowsers(t *testing.T) {
 	if !d.Backend.TabClosed(999999) {
 		t.Errorf("TabClosed(999999) = false, want true (unknown ID)")
 	}
+}
+
+// callBrowser runs one tools/call batch and returns its text + isError.
+func callBrowser(t *testing.T, c *mcp.Client, commands string) (string, bool) {
+	t.Helper()
+	raw, err := c.Call("tools/call", map[string]any{
+		"name":      "browser",
+		"arguments": map[string]any{"commands": commands},
+	})
+	if err != nil {
+		t.Fatalf("tools/call %q: %v", commands, err)
+	}
+	var res struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		t.Fatalf("unmarshal: %v (raw %s)", err, raw)
+	}
+	text := ""
+	if len(res.Content) > 0 {
+		text = res.Content[0].Text
+	}
+	return text, res.IsError
+}
+
+// startDaemonWithFake boots a daemon plus the fake extension (tab 101)
+// and a client, with the backend given a tick to notice the browser.
+func startDaemonWithFake(t *testing.T) (*Daemon, *fakeExtension, *mcp.Client) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("BROWSER_CTL_HOME", home)
+	d, err := Start(0, func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("start daemon: %v", err)
+	}
+	t.Cleanup(func() { d.Stop("test") })
+	deadline := time.Now().Add(5 * time.Second)
+	for FetchStatus(d.Port) == nil && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	fake := newFakeExtension(t, d.Port)
+	t.Cleanup(func() { fake.ws.Close() })
+	time.Sleep(600 * time.Millisecond) // watchBrowsers tick
+	c, err := mcp.Dial(d.Port, d.Token)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return d, fake, c
+}
+
+// TestTabSelectClaimsTab: selecting an existing tab attaches its
+// debugger right there, instead of leaving the failure for the next
+// command.
+func TestTabSelectClaimsTab(t *testing.T) {
+	_, fake, c := startDaemonWithFake(t)
+	if out, isErr := callBrowser(t, c, "tab select 101"); isErr {
+		t.Fatalf("tab select: %s", out)
+	}
+	if got := fake.attaches(101); got != 1 {
+		t.Fatalf("attaches(101) = %d, want 1: selecting a tab must claim it", got)
+	}
+}
+
+// TestDetachedStepReattachesAndRetries: when Chrome drops the debugger
+// under the daemon's cached CDP client, the next step re-attaches and
+// retries once instead of failing the batch.
+func TestDetachedStepReattachesAndRetries(t *testing.T) {
+	_, fake, c := startDaemonWithFake(t)
+	if out, isErr := callBrowser(t, c, "tab select 101"); isErr {
+		t.Fatalf("tab select: %s", out)
+	}
+	fake.dropDebugger(101)
+	out, isErr := callBrowser(t, c, "get title")
+	if isErr {
+		t.Fatalf("get title after detach should recover, got: %s", out)
+	}
+	if got := fake.attaches(101); got != 2 {
+		t.Fatalf("attaches(101) = %d, want 2 (select + re-attach)", got)
+	}
+}
+
+// TestDetachedStepStillFailingNamesTabAndRetry: when the retry also
+// fails detached, the error that reaches the user names the tab and
+// says a re-attach + retry already happened.
+func TestDetachedStepStillFailingNamesTabAndRetry(t *testing.T) {
+	_, fake, c := startDaemonWithFake(t)
+	if out, isErr := callBrowser(t, c, "tab select 101"); isErr {
+		t.Fatalf("tab select: %s", out)
+	}
+	fake.stickDebugger(101)
+	out, isErr := callBrowser(t, c, "get title")
+	if !isErr {
+		t.Fatalf("get title should fail, got %q", out)
+	}
+	if !contains(out, "tab 101") || !contains(out, "re-attached and retried") {
+		t.Fatalf("error should name the tab and the retry: %q", out)
+	}
+}
+
+// TestProbePorts: a live browsermcp status on a well-known port is
+// found even with no daemon.json anywhere.
+func TestProbePorts(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:9010")
+	if err != nil {
+		t.Skipf("port 9010 unavailable: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"product": "browsermcp", "version": "2.0.0", "protocol": 1, "minProtocol": 1, "pid": 4242,
+		})
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+	port, st := ProbePorts(0)
+	if st == nil || port != 9010 || st.Pid != 4242 {
+		t.Fatalf("ProbePorts(0) = %d, %+v; want 9010 pid 4242", port, st)
+	}
+	if _, st := ProbePorts(9010); st == nil {
+		t.Fatal("ProbePorts(9010) should find the same server")
+	}
+}
+
+// fakePage scripts one tab's CDP answers for the issue tests: an AX
+// tree per frame, an optional frame tree, and a programmable
+// Runtime.evaluate. It records how the engine resolved nodes, so a
+// test can assert WHICH resolution path a command took (precise
+// backend-node resolution vs the stored querySelector expression).
+type fakePage struct {
+	axByFrame map[string][]any // frameId -> AX nodes; "" = main frame (no frameId param)
+	frameTree map[string]any   // Page.getFrameTree result; nil = single-frame default
+	evalFn    func(expr string) (map[string]any, bool)
+
+	mu        sync.Mutex
+	resolved  []int    // backendNodeIds passed to DOM.resolveNode
+	funcCalls []string // functionDeclarations passed to Runtime.callFunctionOn
+	evaluated []string // Runtime.evaluate expressions, in order
+}
+
+func (f *fakeExtension) setPage(tabID int, p *fakePage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pages[tabID] = p
+}
+
+func (f *fakeExtension) pageFor(tabID int) *fakePage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pages[tabID]
+}
+
+// answer serves the scripted CDP methods; ok=false means "fall
+// through to the fake's generic answers".
+func (pg *fakePage) answer(method string, params json.RawMessage) (any, bool) {
+	switch method {
+	case "Page.getFrameTree":
+		if pg.frameTree != nil {
+			return pg.frameTree, true
+		}
+	case "Accessibility.getFullAXTree":
+		var p struct {
+			FrameID string `json:"frameId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		if nodes, ok := pg.axByFrame[p.FrameID]; ok {
+			return map[string]any{"nodes": nodes}, true
+		}
+	case "Runtime.evaluate":
+		var p struct {
+			Expression string `json:"expression"`
+		}
+		_ = json.Unmarshal(params, &p)
+		pg.mu.Lock()
+		pg.evaluated = append(pg.evaluated, p.Expression)
+		pg.mu.Unlock()
+		if pg.evalFn != nil {
+			return pg.evalFn(p.Expression)
+		}
+	case "DOM.resolveNode":
+		var p struct {
+			BackendNodeID int `json:"backendNodeId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		pg.mu.Lock()
+		pg.resolved = append(pg.resolved, p.BackendNodeID)
+		pg.mu.Unlock()
+		return map[string]any{"object": map[string]any{"objectId": fmt.Sprintf("obj-%d", p.BackendNodeID)}}, true
+	case "Runtime.callFunctionOn":
+		var p struct {
+			FunctionDeclaration string `json:"functionDeclaration"`
+		}
+		_ = json.Unmarshal(params, &p)
+		pg.mu.Lock()
+		pg.funcCalls = append(pg.funcCalls, p.FunctionDeclaration)
+		pg.mu.Unlock()
+		if strings.Contains(p.FunctionDeclaration, "elementFromPoint") {
+			return map[string]any{"result": map[string]any{"type": "string", "value": "ok"}}, true
+		}
+		return map[string]any{"result": map[string]any{"type": "boolean", "value": true}}, true
+	case "DOM.getBoxModel":
+		return map[string]any{"model": map[string]any{"content": []float64{0, 0, 10, 0, 10, 10, 0, 10}}}, true
+	}
+	return nil, false
+}
+
+func (pg *fakePage) resolvedNodes() []int {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	return append([]int(nil), pg.resolved...)
+}
+
+func (pg *fakePage) calls() []string {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	return append([]string(nil), pg.funcCalls...)
+}
+
+func (pg *fakePage) evals() []string {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	return append([]string(nil), pg.evaluated...)
+}
+
+// axNode builds one Accessibility.getFullAXTree node for a fixture.
+func axNode(id, role, name string, backend int, children ...string) map[string]any {
+	n := map[string]any{
+		"nodeId":   id,
+		"role":     map[string]any{"value": role},
+		"name":     map[string]any{"value": name},
+		"childIds": children,
+	}
+	if backend != 0 {
+		n["backendDOMNodeId"] = backend
+	}
+	return n
 }

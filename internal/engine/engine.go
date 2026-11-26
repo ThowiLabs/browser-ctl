@@ -55,20 +55,54 @@ type Session struct {
 	Pending  int          // tab dragged into the app's group, taken next call
 	Browser  string       // chosen browser profile, "" = default
 	LastCall time.Time
-	// LastRefs maps snapshot refs (e12) to a JS expression yielding the
-	// element, from the session's last snapshot.
-	LastRefs map[string]string
-	// LastRefNodes maps snapshot refs to backend DOM node ids (from the
-	// accessibility tree), for precise CDP resolution.
-	LastRefNodes map[string]int
-	// LastAX is the last snapshot's nodes in document order (ref, role,
-	// accessible name), for locator resolution against the AX tree.
-	LastAX []AXEntry
+	// RefTabs holds each tab's snapshot ref space, keyed by tab id.
+	// Refs are only valid on the tab whose snapshot produced them:
+	// two tabs of the same origin (Gmail u/0 and u/1) share roles and
+	// accessible names, so a session-global table let a ref captured
+	// on one tab silently resolve — and act — on the other.
+	RefTabs map[int]*RefTable
 	// CursorX/CursorY is where the simulated cursor overlay was last
 	// left, so the next move can glide from there like a human hand;
 	// CursorKnown is false until the first move.
 	CursorX, CursorY float64
 	CursorKnown      bool
+}
+
+// RefTable is one tab's snapshot ref space: refs (e12) mapped to a
+// JS expression yielding the element, refs mapped to backend DOM
+// node ids (from the accessibility tree) for precise CDP resolution,
+// and the snapshot's nodes in document order (ref, role, accessible
+// name) for locator resolution against the AX tree.
+type RefTable struct {
+	Refs  map[string]string
+	Nodes map[string]int
+	AX    []AXEntry
+}
+
+// setRefs stores a snapshot's ref table for tab, replacing any older
+// snapshot of the same tab. Other tabs' tables are untouched, so
+// switching tabs and coming back keeps each tab's refs usable.
+func (s *Session) setRefs(tab int, refs map[string]string, nodes map[string]int, ax []AXEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.RefTabs == nil {
+		s.RefTabs = map[int]*RefTable{}
+	}
+	s.RefTabs[tab] = &RefTable{Refs: refs, Nodes: nodes, AX: ax}
+}
+
+// currentRefs returns the ref table of the session's current tab —
+// the only table commands may resolve against. A ref captured on
+// another tab is simply absent here, so it fails with the usual
+// "isn't on the page anymore" error instead of acting on the wrong
+// page. Nil when the current tab has no snapshot yet.
+func (s *Session) currentRefs() *RefTable {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.RefTabs == nil {
+		return nil
+	}
+	return s.RefTabs[s.Current]
 }
 
 // AddCapabilities enables capabilities (e.g. "cdp") on the session.
@@ -227,6 +261,36 @@ func (e *Engine) releaseTab(tabID int) {
 	}
 }
 
+// isDetachedError reports whether an error is Chrome/the extension
+// saying the debugger is no longer attached to the tab — the failure a
+// stale cached CDP client produces after the attachment went away
+// (daemon or extension restart, DevTools took over, idle release on the
+// other side). The step never ran, so it is safe to retry once after
+// re-attaching.
+func isDetachedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, frag := range []string{"isn't attached", "is not attached", "not attached", "detached while handling"} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// reattachTab drops the tab's cached state — its CDP client points at
+// an attachment that no longer exists — and claims the tab again, so
+// the next step runs against a live attachment. The tab's capture
+// buffers and snapshot refs go with the stale state; they described a
+// page the engine can no longer see anyway.
+func (e *Engine) reattachTab(tabID int) error {
+	e.releaseTab(tabID)
+	_, err := e.tabStateFor(tabID)
+	return err
+}
+
 // tabStateFor returns (creating) the TabState for a tab, claiming it via
 // the backend and enabling focus emulation so Chrome renders it.
 func (e *Engine) tabStateFor(tabID int) (*TabState, error) {
@@ -317,6 +381,22 @@ func (e *Engine) Run(sess *Session, input string) (string, error) {
 			return strings.Join(out, "\n"), preErr
 		}
 		stepOut, note, dialogOpened, err := e.runStep(sess, ln)
+		if err != nil && isDetachedError(err) {
+			// The current tab's debugger detached under the cached CDP
+			// client (the daemon or the extension restarted, the tab was
+			// released elsewhere…): the step was rejected before it
+			// reached the page, so re-attach and run it once more
+			// instead of failing the whole batch. Only once: a second
+			// detached error is the page's real answer.
+			if tabID := e.CurrentTab(sess); tabID != 0 {
+				if rerr := e.reattachTab(tabID); rerr == nil {
+					stepOut, note, dialogOpened, err = e.runStep(sess, ln)
+					if err != nil && dialogOpened == nil {
+						err = fmt.Errorf("%w — tab %d: the debugger had detached; re-attached and retried the step once", err, tabID)
+					}
+				}
+			}
+		}
 		if dialogOpened != nil {
 			out = append(out, fmt.Sprintf("✓ %s — %s opened. Answer it with `dialog accept` or `dialog dismiss`", echoLine(ln), dialogLabel(dialogOpened)))
 			if i+1 < len(lines) {

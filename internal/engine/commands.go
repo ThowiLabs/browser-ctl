@@ -330,6 +330,14 @@ func doTab(ctx *Context) (string, string, error) {
 		// sin esto una pestaña adoptada no se puede cerrar nunca.
 		sess.Opened[id] = true
 		sess.mu.Unlock()
+		// Selecting a tab must leave it attached: claim it now, so a
+		// debugger that detached while the tab sat idle fails HERE —
+		// with the tab named — instead of surfacing as a surprise in
+		// the next command. (tabStateFor is a no-op when the tab is
+		// already claimed and live.)
+		if _, err := e.tabStateFor(id); err != nil {
+			return "", "", err
+		}
 		// Adopting a user's tab groups it (unless pinned — the extension
 		// handles that).
 		_ = e.backend.GroupTab(id, &e.app)

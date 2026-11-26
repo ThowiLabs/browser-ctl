@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/thovilabs/browser-ctl/internal/daemon"
@@ -24,6 +25,20 @@ func FindOrStart(port int, caps []string) (*mcp.Client, *daemon.DaemonInfo, erro
 		if err == nil {
 			return c, info, nil
 		}
+		// daemon.json's daemon answers status but won't take a client
+		// session: it is wedged, or something else owns the port.
+		// Starting a second daemon would bind the next port and never
+		// see the browser, so name it instead of hanging.
+		return nil, nil, fmt.Errorf("the daemon on 127.0.0.1:%d (pid %d, from %s) answers status but the client session could not be opened — stop it with `browser-ctl shutdown` and retry", info.Port, info.Pid, filepath.Join(home, "daemon.json"))
+	}
+	// No usable daemon.json. A browsermcp server may still answer on a
+	// relay port — a legacy `serve` relay, or a daemon from another
+	// home: the extension connects to the first answering port, so a
+	// new daemon on the next port would never get the browser and every
+	// command would fail as \"no browser connected\". Refuse and name
+	// the port. An explicit --port narrows the probe to that port.
+	if p, st := daemon.ProbePorts(port); st != nil {
+		return nil, nil, fmt.Errorf("a browsermcp server (pid %d) is already listening on 127.0.0.1:%d but %s does not describe a usable daemon (legacy `serve` relay, or another home's daemon) — stop that server first, or pass --port for a different port", st.Pid, p, filepath.Join(home, "daemon.json"))
 	}
 	// Start the daemon detached.
 	exe, err := os.Executable()

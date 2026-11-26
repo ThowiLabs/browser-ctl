@@ -17,6 +17,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -89,6 +90,11 @@ func main() {
 		}
 	case "fill-login":
 		if err := runFillLogin(os.Args[2:]); err != nil {
+			var ue *usageError
+			if errors.As(err, &ue) {
+				fmt.Fprintln(os.Stderr, "browser-ctl:", err)
+				os.Exit(2)
+			}
 			fatal(err)
 		}
 	case "tabs":
@@ -105,6 +111,10 @@ func main() {
 	case "status":
 		info := daemon.FindDaemon(daemon.HomeDir())
 		if info == nil {
+			if p, st := daemon.ProbePorts(0); st != nil {
+				fmt.Printf("a browsermcp server (pid %d) answers on 127.0.0.1:%d, but no usable daemon.json — not a daemon this home can drive\n", st.Pid, p)
+				return
+			}
 			fmt.Println("no daemon is running")
 			return
 		}

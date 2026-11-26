@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/thovilabs/browser-ctl/internal/protocol"
 )
 
 const version = "2.0.0"
@@ -98,6 +100,29 @@ func FindDaemon(home string) *DaemonInfo {
 		return nil
 	}
 	return info
+}
+
+// ProbePorts looks for a live browsermcp server on the well-known
+// relay ports: only `only` when it is non-zero, else RelayPorts in
+// order. It returns the answering port and its status, or (0, nil)
+// when nothing answers. An answering port is not by itself a usable
+// daemon — a daemon is only drivable through daemon.json, which
+// holds its client token — but an answering port with no usable
+// daemon.json (a legacy `serve` relay, another home's daemon) means
+// a new daemon would bind the NEXT port while the extension stays
+// with the first one it found, so callers name the conflict instead
+// of starting a second server that can never reach the browser.
+func ProbePorts(only int) (int, *Status) {
+	ports := protocol.RelayPorts
+	if only != 0 {
+		ports = []int{only}
+	}
+	for _, port := range ports {
+		if st := FetchStatus(port); st != nil {
+			return port, st
+		}
+	}
+	return 0, nil
 }
 
 // NewToken returns a fresh per-boot token (base64url of 32 random bytes).
