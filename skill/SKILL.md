@@ -1,6 +1,10 @@
 ---
 name: browser-ctl
 description: Drive the user's own Chrome (their signed-in sites, their profile) from any editor or agent that has no MCP support, by shelling out to the browser-ctl CLI. Use when the task needs the browser — navigate, click, fill forms, read the page, take screenshots — and the editor cannot talk MCP natively.
+commands:
+  - name: browser-ctl
+    description: Drive the user's Chrome by bare name (run, tabs, status, fill-login). The binary lives in the bin/ of this skill's parent folder.
+    vault: true
 ---
 
 # browser-ctl
@@ -77,6 +81,26 @@ Exit code `0` = success (stdout has the output), `1` = failure (stderr has the e
 | `eval` | `eval "<js>"` | JSON result |
 | `tab` | `tab list\|new [url]\|select <id>\|close [id]` | tab list / id |
 | `help` | `help [command]` | command list |
+
+## Signing in with a credential vault (Lilith hosts)
+
+`browser-ctl fill-login <domain>` fills the login form of the **active page**
+with a credential it receives **only on stdin**, as JSON
+`{"username","password"}`. On a Lilith host with the experimental web vault
+enabled, the agent just runs the command by its bare name — no paths:
+
+```sh
+browser-ctl fill-login youtube.com
+# => login filled for youtube.com
+```
+
+Lilith looks the domain up in its encrypted vault (asking the user to type
+the credential in a local secure prompt if it is missing) and attaches the
+payload to the process's stdin. The values never appear in arguments, in
+the command output or in any log, and the agent never sees them. The
+command refuses to fill when the active page's host is not the requested
+domain or a subdomain of it, and fails explicitly when no payload arrives
+on stdin. Do not pass credentials as arguments, ever.
 
 ### Targets
 

@@ -6,6 +6,8 @@
 //	browser-ctl daemon [--port N] [--stderr]   long-lived daemon
 //	browser-ctl mcp [--caps cdp] [--port N]    MCP server over stdio
 //	browser-ctl run [--port N] "goto https://example.com"
+//	browser-ctl fill-login [--port N] <domain>  fill the active page's login form
+//	                                            with a vault payload read from stdin
 //	browser-ctl run --port N --commands-file commands.txt
 //	browser-ctl tabs [--port N]
 //	browser-ctl status
@@ -83,6 +85,10 @@ func main() {
 			fmt.Println(out)
 		}
 		if err != nil {
+			fatal(err)
+		}
+	case "fill-login":
+		if err := runFillLogin(os.Args[2:]); err != nil {
 			fatal(err)
 		}
 	case "tabs":
@@ -201,6 +207,8 @@ Usage:
   browser-ctl run [flags] "cmd1
 cmd2"       run a batch of browser commands
   browser-ctl run --commands-file file.txt  read the commands from a file
+  browser-ctl fill-login [--port N] <domain>  fill the active page's login form with
+                                            the vault payload (JSON) read from stdin
   browser-ctl tabs [--port N]               list the connected browser's tabs
   browser-ctl status                        show the running daemon
   browser-ctl shutdown [--port N]           stop the daemon
