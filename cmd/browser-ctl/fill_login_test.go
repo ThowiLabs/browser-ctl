@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -18,6 +19,29 @@ func TestParseVaultPayload(t *testing.T) {
 		} else if strings.Contains(err.Error(), "s3cret") {
 			t.Fatalf("el error no debe ecoar el payload: %v", err)
 		}
+	}
+}
+
+// TestParseFillLoginArgs: los flags se parsean antes de leer stdin —
+// --help/-h es ayuda (exit 0) y la falta de dominio es usageError
+// (main lo mapea a exit 2); ninguno de los dos caminos toca el payload.
+func TestParseFillLoginArgs(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"-h"}} {
+		_, _, help, err := parseFillLoginArgs(args)
+		if err != nil || !help {
+			t.Fatalf("args %v: help=%v err=%v", args, help, err)
+		}
+	}
+	for _, args := range [][]string{{}, {"--bogus"}, {"a.com", "b.com"}, {"--port"}} {
+		_, _, help, err := parseFillLoginArgs(args)
+		var ue *usageError
+		if help || !errors.As(err, &ue) {
+			t.Fatalf("args %v: help=%v err=%v, want usageError", args, help, err)
+		}
+	}
+	port, domain, help, err := parseFillLoginArgs([]string{"--port", "9011", "https://www.YouTube.com/login"})
+	if err != nil || help || port != 9011 || domain != "www.youtube.com" {
+		t.Fatalf("port=%d domain=%q help=%v err=%v", port, domain, help, err)
 	}
 }
 

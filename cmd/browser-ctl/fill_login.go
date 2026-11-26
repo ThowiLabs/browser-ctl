@@ -165,16 +165,48 @@ func buildFillCommand(selector, text string) string {
 	return "fill " + quoteCommandArg(selector) + " " + quoteCommandArg(text)
 }
 
-func runFillLogin(args []string) error {
-	fs := flag.NewFlagSet("fill-login", flag.ExitOnError)
-	port := fs.Int("port", 0, "daemon port (0 = find or start)")
-	fs.Parse(args)
-	if fs.NArg() != 1 {
-		return errors.New("usage: browser-ctl fill-login [--port N] <domain>")
+// fillLoginUsage is the subcommand's one-line usage.
+const fillLoginUsage = "usage: browser-ctl fill-login [--port N] <domain>"
+
+// usageError marks a command-line usage problem; main exits 2 for it
+// (like an unknown subcommand), not 1 like a runtime failure.
+type usageError struct{ msg string }
+
+func (e *usageError) Error() string { return e.msg }
+
+// parseFillLoginArgs parses the flags BEFORE anything reads stdin:
+// --help/-h is reported as help (the caller prints usage and exits 0)
+// and a missing or malformed domain is a usage error. Neither path may
+// ever reach the vault payload on stdin — `fill-login --help` once fell
+// through to the payload read and surfaced as a vault failure.
+func parseFillLoginArgs(args []string) (port int, domain string, help bool, err error) {
+	fs := flag.NewFlagSet("fill-login", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	p := fs.Int("port", 0, "daemon port (0 = find or start)")
+	if perr := fs.Parse(args); perr != nil {
+		if errors.Is(perr, flag.ErrHelp) {
+			return 0, "", true, nil
+		}
+		return 0, "", false, &usageError{msg: fillLoginUsage}
 	}
-	domain := normalizeHost(fs.Arg(0))
+	if fs.NArg() != 1 {
+		return 0, "", false, &usageError{msg: fillLoginUsage}
+	}
+	domain = normalizeHost(fs.Arg(0))
 	if domain == "" {
-		return errors.New("fill-login: empty domain")
+		return 0, "", false, &usageError{msg: "fill-login: empty domain — " + fillLoginUsage}
+	}
+	return *p, domain, false, nil
+}
+
+func runFillLogin(args []string) error {
+	port, domain, help, err := parseFillLoginArgs(args)
+	if err != nil {
+		return err
+	}
+	if help {
+		fmt.Println(fillLoginUsage + "\n\nFill the active page's login form with the vault payload (JSON {\"username\",\"password\"}) read from stdin, attached by the host. The active page's host must match the domain.")
+		return nil
 	}
 	data, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024))
 	if err != nil {
@@ -184,7 +216,7 @@ func runFillLogin(args []string) error {
 	if err != nil {
 		return err
 	}
-	out, err := client.RunCommands(*port, buildLocateCommand(), nil)
+	out, err := client.RunCommands(port, buildLocateCommand(), nil)
 	if err != nil {
 		return err
 	}
@@ -206,7 +238,7 @@ func runFillLogin(args []string) error {
 		cmds = append(cmds, buildFillCommand(loc.User, payload.Username))
 	}
 	cmds = append(cmds, buildFillCommand(loc.Pass, payload.Password))
-	if _, err := client.RunCommands(*port, strings.Join(cmds, "\n"), nil); err != nil {
+	if _, err := client.RunCommands(port, strings.Join(cmds, "\n"), nil); err != nil {
 		return err
 	}
 	fmt.Printf("login filled for %s\n", domain)
