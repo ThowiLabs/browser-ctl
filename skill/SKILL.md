@@ -101,6 +101,20 @@ snapshot"
 
 Exit code `0` = success (stdout has the output), `1` = failure (stderr has the error).
 
+### Subcommands
+
+| Subcommand | Syntax | What it does |
+|---|---|---|
+| `run` | `browser-ctl run "<lines>" [--port N] [--commands-file <file>] [--caps cdp]` | Run a batch of commands (below); finds or starts the daemon. |
+| `fill-login` | `browser-ctl fill-login <domain>` | Fill the active page's login form with a vault payload read from stdin (see "Signing in" below). |
+| `tabs` | `browser-ctl tabs [--port N]` | List the connected browser's tabs. |
+| `status` | `browser-ctl status` | Show the running daemon (port, pid, version); says so when none is running. |
+| `daemon` | `browser-ctl daemon [--port N]` | Start the long-lived daemon (relay + browser state) in the foreground. `run`, `tabs` and `mcp` find or start it on demand, so you rarely need this. |
+| `shutdown` | `browser-ctl shutdown [--port N]` | Stop the daemon. |
+| `mcp` | `browser-ctl mcp [--caps cdp] [--port N]` | Run the CLI as an MCP server over stdio (JSON-RPC), exposing the same commands as MCP tools; finds or starts the daemon. `--caps cdp` enables the raw `cdp` command. |
+| `serve` | `browser-ctl serve [--port N] [--no-wait]` | Legacy relay-only mode: start the relay and wait for a browser to connect. |
+| `help` | `browser-ctl help` | Print the usage summary. |
+
 ### Commands
 
 | Command | Syntax | Returns |
@@ -109,19 +123,29 @@ Exit code `0` = success (stdout has the output), `1` = failure (stderr has the e
 | `back` / `forward` / `reload` | no args | note |
 | `click` | `click <target> [--double] [--button left\|right] [--modifiers Shift,Control]` | ✓ |
 | `hover` | `hover <target>` | ✓ |
+| `drag` | `drag <source> <target>` | ✓ |
 | `scroll` | `scroll top\|bottom\|<dir> [<px>]` | position note |
 | `fill` | `fill <target> "<text>" [--submit]` | ✓ |
 | `type` | `type "<text>" [--submit]` | ✓ |
 | `press` | `press <key>` | ✓ |
 | `select` | `select <target> "<value>"…` | ✓ |
+| `upload` | `upload <target> <path>...` | ✓ |
 | `check` / `uncheck` | `check <target>` | ✓ |
 | `wait` | `wait <ms> \| wait --text "<t>" \| wait --url <url>` | ✓ (10 s timeout) |
+| `dialog` | `dialog accept ["<text>"] \| dismiss` | ✓ (ends the batch the dialog opened in) |
 | `snapshot` | `snapshot` | element tree with `e#` refs |
 | `find` | `find "<text>"` | matching lines |
 | `get` | `get text\|value\|count <target> \| get url \| get title` | value |
+| `console` | `console [--errors] [--max N\|all]` | console and uncaught-error lines |
+| `requests` | `requests [--static] [--filter "<text>"] [--max N\|all]` | recent network requests |
+| `request` | `request <id> [--body] [--max N\|all]` | one request's headers (and body) |
 | `screenshot` | `screenshot [--path <file>]` | ASCII preview or saved file |
+| `pdf` | `pdf [<path>] [--landscape] [--path <file>]` | saved-file note |
+| `download` | `download <url>\|<target> [--path <file>]` | saved-file note |
 | `eval` | `eval "<js>"` | JSON result |
 | `tab` | `tab list\|new [url]\|select <id>\|close [id]` | tab list / id |
+| `browser` | `browser list \| use "<name>"\|<id>` | browser list / pinned note |
+| `cdp` | `cdp <Domain.method> [<json>] \| cdp on <event>... \| cdp events [<event>] \| cdp wait <event>` | JSON result (raw CDP; needs `--caps cdp`) |
 | `help` | `help [command]` | command list |
 
 ## Signing in with a credential vault (Lilith hosts)
