@@ -14,6 +14,48 @@ commands:
 `127.0.0.1`) directly — **no MCP server, no Node runtime**. Any editor, agent or script can drive
 the browser by running the binary as a subprocess and reading its stdout.
 
+## Invoking in Lilith: bare name, always
+
+On a Lilith host, this skill's command is registered by name: invoke it
+exactly as `browser-ctl ...`. Lilith resolves the bare name directly to
+the binary in this skill's `bin/` and runs it — no path is needed or
+wanted. This is a hard rule, not a style preference:
+
+- NEVER invoke it by path (`./bin/browser-ctl`, `C:\...\browser-ctl.exe`).
+- NEVER `cd` into the skill folder (or anywhere) to run it.
+- NEVER probe for it first with `where`, `Get-Command`, `ls` or `test -f`.
+- Do NOT use the `scripts/browserctl.*` wrappers on a Lilith host; they
+  exist only for hosts without skill-command resolution.
+
+If `browser-ctl` fails to resolve, do not hunt for the file: the usual
+cause is that `bin/` has no binary for the current platform. Follow the
+next section.
+
+## If the binary is missing for this platform: compile it
+
+Lilith indexes the executables in the `bin/` of the folder that contains
+this `skill/` folder. If that `bin/` holds no binary for the current
+platform — only the other platform's (e.g. just `browser-ctl.exe` while
+you are on Linux), or none at all — build it from this repository's
+sources and drop it in that same `bin/`, named for the platform:
+
+- Windows → `browser-ctl.exe`
+- Linux / macOS → `browser-ctl`
+
+From the root of the checkout (the folder that contains `skill/`):
+
+```sh
+# Windows
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/browser-ctl.exe ./cmd/browser-ctl
+# Linux / macOS
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/browser-ctl ./cmd/browser-ctl
+```
+
+Then retry the command by its bare name — Lilith picks the new binary up
+from `bin/`. If Go is not installed or the repository sources are not at
+hand, tell the user and stop: do not search the disk for a browser-ctl
+binary, and do not download one from anywhere else.
+
 ## When to use
 
 - The agent must operate a real browser (the user's Chrome: their logins, their profile).
